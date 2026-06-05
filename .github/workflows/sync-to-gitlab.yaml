@@ -1,0 +1,19 @@
+name: Sync to GitLab
+
+on:
+  push:
+    branches: [ "main", "master" ] # Adjust if your default branch is named something else
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Fetches all history so branches sync cleanly
+
+      - name: Push to GitLab Mirror
+        run: |
+          # Replace <your-gitlab-username> and the URL path with your actual CEA GitLab details
+          git push --prune https://akallits:${{ secrets.GITLAB_TOKEN }}@drf-gitlab.cea.fr/p2/vmm-analysis.git +refs/heads/*:refs/heads/* +refs/tags/*:refs/tags/*
