@@ -109,18 +109,24 @@ def parse_block(block: bytes, frame_counter: int, fec_id: int,
 # LIVE-MONITORING HELPERS
 #########################################
 def follow_pcap(filename):
-    """Yield packets from a growing pcapng file indefinitely (tail -f style)."""
-    file_offset = 0
+    """Yield packets from a growing pcapng file indefinitely (tail -f style).
+
+    PcapReader requires the file's global header at position 0, so we reopen
+    from the start on every poll and skip packets we have already yielded.
+    """
+    pkts_yielded = 0
     while True:
         try:
-            with open(filename, "rb") as f:
-                f.seek(file_offset)
-                reader = PcapReader(f)
-                for pkt in reader:
-                    yield pkt
-                file_offset = f.tell()
+            with PcapReader(filename) as reader:
+                new_count = 0
+                for new_count, pkt in enumerate(reader, 1):
+                    if new_count > pkts_yielded:
+                        yield pkt
+                pkts_yielded = new_count  # only advance after a clean full read
         except FileNotFoundError:
             pass
+        except Exception:
+            pass  # Scapy_Exception when file has no new data yet; retry next poll
         time.sleep(0.1)
 
 
