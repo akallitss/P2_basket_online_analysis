@@ -103,11 +103,19 @@ def parse_block(block: bytes, frame_counter: int, fec_id: int,
 #########################################
 # MAIN
 #########################################
-if len(sys.argv) < 2:
-    print("Usage: python3 vmm_hybrid_pcapng_monitoring.py <pcap_file>")
-    sys.exit(1)
+import argparse
 
-pcap_file = sys.argv[1]
+_ap = argparse.ArgumentParser(
+    description="VMM3 hybrid diagnostic: parse a pcapng capture and produce QA plots + ROOT output."
+)
+_ap.add_argument("pcap_file", help="Input .pcapng file")
+_ap.add_argument("--no-hits-tree", action="store_true",
+                 help="Skip writing the per-hit 'hits' TTree (saves time and disk for large files)")
+_args = _ap.parse_args()
+
+pcap_file    = _args.pcap_file
+save_hits_tree = not _args.no_hits_tree
+
 if not os.path.isfile(pcap_file):
     print(f"File not found: {pcap_file}")
     sys.exit(1)
@@ -549,22 +557,25 @@ for v in vmm_ids:
     del vdata, adc_all, adc_ot, adc_not_ot
 
 # --- hits TTree: one row per hit, written into rf via Cling-compiled C++ filler ---
-rf.cd()
-_hits_tree = ROOT.TTree("hits", "Per-hit data")
-ROOT._vmm_fill_hits(
-    _hits_tree,
-    np.ascontiguousarray(hits['fec'].values,            dtype=np.uint8),
-    np.ascontiguousarray(hits['vmm'].values,            dtype=np.uint8),
-    np.ascontiguousarray(hits['ch'].values,             dtype=np.uint8),
-    np.ascontiguousarray(hits['adc'].values,            dtype=np.uint16),
-    np.ascontiguousarray(hits['over_threshold'].values, dtype=np.uint8),
-    np.ascontiguousarray(hits['time'].values,           dtype=np.uint32),
-    np.ascontiguousarray(hits['offset'].values.view(np.uint8)),
-    np.ascontiguousarray(hits['bcid'].values,           dtype=np.uint16),
-    np.ascontiguousarray(hits['tdc'].values,            dtype=np.uint8),
-    len(hits),
-)
-_hits_tree.Write()
+if save_hits_tree:
+    rf.cd()
+    _hits_tree = ROOT.TTree("hits", "Per-hit data")
+    ROOT._vmm_fill_hits(
+        _hits_tree,
+        np.ascontiguousarray(hits['fec'].values,            dtype=np.uint8),
+        np.ascontiguousarray(hits['vmm'].values,            dtype=np.uint8),
+        np.ascontiguousarray(hits['ch'].values,             dtype=np.uint8),
+        np.ascontiguousarray(hits['adc'].values,            dtype=np.uint16),
+        np.ascontiguousarray(hits['over_threshold'].values, dtype=np.uint8),
+        np.ascontiguousarray(hits['time'].values,           dtype=np.uint32),
+        np.ascontiguousarray(hits['offset'].values.view(np.uint8)),
+        np.ascontiguousarray(hits['bcid'].values,           dtype=np.uint16),
+        np.ascontiguousarray(hits['tdc'].values,            dtype=np.uint8),
+        len(hits),
+    )
+    _hits_tree.Write()
+else:
+    print("Skipping hits TTree (--no-hits-tree)")
 
 rf.Close()
 print(f"ROOT file: {root_path}")
