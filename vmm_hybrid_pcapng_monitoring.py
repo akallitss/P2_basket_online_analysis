@@ -18,9 +18,22 @@ hits DataFrame columns:
     over_threshold : over-threshold flag (bool)
 """
 
-#THIS IS A TEST
 import sys
 import os
+import struct
+
+# Self-re-exec: ROOT was built against Python 3.12; if we're running under any
+# other interpreter, replace this process with the right one (sourcing thisroot.sh
+# first so PyROOT finds its shared libraries).
+_ROOT312  = "/local/home/ak271430/miniconda3/envs/root312/bin/python3.12"
+_THISROOT = "/local/home/ak271430/Software/root/bin/thisroot.sh"
+if sys.executable != _ROOT312:
+    os.execvp("bash", [
+        "bash", "-c",
+        f'source "{_THISROOT}" && exec "{_ROOT312}" "$@"',
+        "python", *sys.argv,
+    ])
+
 import array
 
 # Redirect per-user cache dirs before any import touches /tmp/.cache on shared machines
@@ -33,6 +46,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
 from scapy.all import PcapReader, UDP, IP
 import ROOT
 ROOT.gROOT.SetBatch(True)
@@ -69,15 +83,14 @@ def parse_block(block: bytes, frame_counter: int, fec_id: int,
     if len(block) < 22 or block[4:7] != b'VM3':
         return
     for i in range(0, len(block) - 22, 6):
-        d1 = "{:032b}".format(int(block[i+16:i+20].hex(), 16))
-        d2 = "{:016b}".format(int(block[i+20:i+22].hex(), 16))
-        if d2[0] == '1':
+        d1, d2 = struct.unpack_from('>IH', block, i + 16)
+        if d2 & 0x8000:          # valid-hit flag = MSB of d2
             fec_buf.append(fec_id)
-            vmm_buf.append(int(d1[5:10], 2))
+            vmm_buf.append((d1 >> 22) & 0x1F)   # bits 26-22 of d1
             time_buf.append(frame_counter)
-            ch_buf.append(int(d2[2:8], 2))
-            adc_buf.append(int(d1[10:20], 2))
-            ot_buf.append(int(d2[1], 2))
+            ch_buf.append((d2 >> 8) & 0x3F)     # bits 13-8 of d2
+            adc_buf.append((d1 >> 12) & 0x3FF)  # bits 21-12 of d1
+            ot_buf.append((d2 >> 14) & 0x1)     # bit 14 of d2
 
 #########################################
 # MAIN
@@ -119,7 +132,7 @@ with PcapReader(pcap_file) as reader:
     for pkt in reader:
         if UDP in pkt and IP in pkt and pkt[IP].src in src_ips:
             payload = bytes(pkt[UDP].payload)
-            fc     = int(payload[0:4].hex(), 16)
+            fc     = struct.unpack_from('>I', payload)[0]
             fec_id = int(pkt[IP].src.split('.')[-1])
             n_before = len(fec_buf)
             parse_block(payload, fc, fec_id,
@@ -141,6 +154,7 @@ hits = pd.DataFrame({
     'adc':            np.frombuffer(adc_buf,  dtype=np.uint16).copy(),
     'over_threshold': np.frombuffer(ot_buf,   dtype=np.uint8).astype(bool).copy(),
 })
+del fec_buf, vmm_buf, time_buf, ch_buf, adc_buf, ot_buf
 
 mem_mb = hits.memory_usage(deep=True).sum() / 1e6
 print(f"DataFrame memory: {mem_mb:.1f} MB")
@@ -148,6 +162,13 @@ print(f"\nVMM IDs found: {sorted(hits.vmm.unique())}")
 for v in sorted(hits.vmm.unique()):
     n = int((hits.vmm == v).sum())
     print(f"  VMM {v:2d}: {n:,} hits")
+
+#########################################
+# HISTOGRAM PARAMETERS
+#########################################
+ADC_BINS = 100;  ADC_MIN = 0;  ADC_MAX = 1024
+CH_BINS  = 64;   CH_MIN  = 0;  CH_MAX  = 64
+TIME_BINS = 200
 
 #########################################
 # PLOTS
@@ -163,7 +184,7 @@ fig_adc.suptitle("ADC distributions per VMM", fontsize=14)
 for idx, v in enumerate(vmm_ids):
     ax   = axes_adc[idx // ncols][idx % ncols]
     data = hits.loc[hits.vmm == v, 'adc']
-    ax.hist(data, bins=100, range=(0, 1024), color='steelblue', alpha=0.8)
+    ax.hist(data, bins=ADC_BINS, range=(ADC_MIN, ADC_MAX), color='steelblue', alpha=0.8)
     ax.set_title(f"VMM {v}  ({len(data):,} hits)")
     ax.set_xlabel("ADC")
     ax.set_ylabel("Counts")
@@ -179,8 +200,8 @@ for idx, v in enumerate(vmm_ids):
     vmm_hit = hits.loc[hits.vmm == v]
     adc_off = vmm_hit.loc[~vmm_hit.over_threshold, 'adc']
     adc_on  = vmm_hit.loc[ vmm_hit.over_threshold, 'adc']
-    ax.hist(adc_off, bins=100, range=(0, 1024), color='steelblue', alpha=0.6, label=f'Not OT ({len(adc_off):,})')
-    ax.hist(adc_on,  bins=100, range=(0, 1024), color='tomato',    alpha=0.6, label=f'OT ({len(adc_on):,})')
+    ax.hist(adc_off, bins=ADC_BINS, range=(ADC_MIN, ADC_MAX), color='steelblue', alpha=0.6, label=f'Not OT ({len(adc_off):,})')
+    ax.hist(adc_on,  bins=ADC_BINS, range=(ADC_MIN, ADC_MAX), color='tomato',    alpha=0.6, label=f'OT ({len(adc_on):,})')
     ax.set_title(f"VMM {v}")
     ax.set_xlabel("ADC")
     ax.set_ylabel("Counts")
@@ -212,7 +233,7 @@ fig_ch.suptitle("Channel occupancy per VMM", fontsize=14)
 for idx, v in enumerate(vmm_ids):
     ax   = axes_ch[idx // ncols][idx % ncols]
     data = hits.loc[hits.vmm == v, 'ch']
-    ax.hist(data, bins=64, range=(0, 64), color='tomato', alpha=0.8)
+    ax.hist(data, bins=CH_BINS, range=(CH_MIN, CH_MAX), color='tomato', alpha=0.8)
     ax.set_title(f"VMM {v}  ({len(data):,} hits)")
     ax.set_xlabel("Channel")
     ax.set_ylabel("Counts")
@@ -220,6 +241,25 @@ for idx, v in enumerate(vmm_ids):
 for idx in range(n_vmm, nrows * ncols):
     axes_ch[idx // ncols][idx % ncols].set_visible(False)
 fig_ch.tight_layout()
+
+# --- ADC vs channel 2D histogram ---
+fig_adc2d, axes_adc2d = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows), squeeze=False)
+fig_adc2d.suptitle("ADC vs channel (2-D, log colour scale) per VMM", fontsize=14)
+for idx, v in enumerate(vmm_ids):
+    ax    = axes_adc2d[idx // ncols][idx % ncols]
+    vdata = hits.loc[hits.vmm == v]
+    _, _, _, img = ax.hist2d(
+        vdata['ch'], vdata['adc'],
+        bins=[CH_BINS, ADC_BINS], range=[[CH_MIN, CH_MAX], [ADC_MIN, ADC_MAX]],
+        cmap='viridis', norm=LogNorm(vmin=1),
+    )
+    plt.colorbar(img, ax=ax, label='Hits')
+    ax.set_title(f"VMM {v}  ({len(vdata):,} hits)")
+    ax.set_xlabel("Channel")
+    ax.set_ylabel("ADC")
+for idx in range(n_vmm, nrows * ncols):
+    axes_adc2d[idx // ncols][idx % ncols].set_visible(False)
+fig_adc2d.tight_layout()
 
 # --- Total hits per VMM ---
 fig_sum, ax_sum = plt.subplots(figsize=(max(6, n_vmm), 4))
@@ -231,20 +271,6 @@ ax_sum.set_xlabel("VMM ID")
 ax_sum.set_ylabel("Hits")
 fig_sum.tight_layout()
 
-# --- Time distribution: one PNG per VMM ---
-n_time_bins = 200
-t_min, t_max = int(hits.time.min()), int(hits.time.max())
-time_figs = {}
-for v in vmm_ids:
-    fig_t, ax_t = plt.subplots(figsize=(12, 5))
-    data = hits.loc[hits.vmm == v, 'time']
-    ax_t.hist(data, bins=n_time_bins, range=(t_min, t_max), color='darkorange', alpha=0.8)
-    ax_t.set_title(f"Hit rate over time — VMM {v}  ({len(data):,} hits)")
-    ax_t.set_xlabel("Frame counter (proxy for time)")
-    ax_t.set_ylabel("Hits per bin")
-    fig_t.tight_layout()
-    time_figs[v] = fig_t
-
 # --- Save all PNGs in qa_plots/<base>/ ---
 base     = os.path.splitext(os.path.basename(pcap_file))[0]
 out_dir  = os.path.join(os.path.dirname(os.path.abspath(pcap_file)), "qa_plots", base)
@@ -252,15 +278,29 @@ os.makedirs(out_dir, exist_ok=True)
 
 saved = []
 
-fig_adc.savefig(os.path.join(out_dir,    f"{base}_adc.png"),        dpi=150); saved.append("_adc.png")
-fig_adc_ot.savefig(os.path.join(out_dir, f"{base}_adc_ot.png"),    dpi=150); saved.append("_adc_ot.png")
-fig_ot.savefig(os.path.join(out_dir,    f"{base}_ot.png"),          dpi=150); saved.append("_ot.png")
-fig_ch.savefig(os.path.join(out_dir,  f"{base}_chno.png"),         dpi=150); saved.append("_chno.png")
-fig_sum.savefig(os.path.join(out_dir, f"{base}_hits_per_vmm.png"), dpi=150); saved.append("_hits_per_vmm.png")
-for v, fig_t in time_figs.items():
-    fname = f"{base}_time_vmm{v}.png"
-    fig_t.savefig(os.path.join(out_dir, fname), dpi=150)
+def _save(fig, fname):
+    fig.savefig(os.path.join(out_dir, fname), dpi=150)
+    plt.close(fig)
     saved.append(fname)
+
+_save(fig_adc,    f"{base}_adc.png")
+_save(fig_adc2d,  f"{base}_adc_vs_ch.png")
+_save(fig_adc_ot, f"{base}_adc_ot.png")
+_save(fig_ot,     f"{base}_ot.png")
+_save(fig_ch,     f"{base}_chno.png")
+_save(fig_sum,    f"{base}_hits_per_vmm.png")
+
+# --- Time distribution: one PNG per VMM (built and saved immediately to avoid accumulation) ---
+t_min, t_max = int(hits.time.min()), int(hits.time.max())
+for v in vmm_ids:
+    fig_t, ax_t = plt.subplots(figsize=(12, 5))
+    data = hits.loc[hits.vmm == v, 'time']
+    ax_t.hist(data, bins=TIME_BINS, range=(t_min, t_max), color='darkorange', alpha=0.8)
+    ax_t.set_title(f"Hit rate over time — VMM {v}  ({len(data):,} hits)")
+    ax_t.set_xlabel("Frame counter (proxy for time)")
+    ax_t.set_ylabel("Hits per bin")
+    fig_t.tight_layout()
+    _save(fig_t, f"{base}_time_vmm{v}.png")
 
 print(f"\nSaved {len(saved)} files in: {out_dir}")
 for name in saved:
@@ -269,14 +309,94 @@ for name in saved:
 #########################################
 # ROOT OUTPUT
 #########################################
+_CHUNK   = 500_000
+_w_chunk = np.ones(_CHUNK, dtype=np.float64)  # reusable weights buffer
+
 def _fill1d(h, arr):
-    a = np.ascontiguousarray(arr, dtype=np.float64)
-    h.FillN(len(a), a, np.ones(len(a), dtype=np.float64))
+    for start in range(0, len(arr), _CHUNK):
+        a = np.ascontiguousarray(arr[start:start + _CHUNK], dtype=np.float64)
+        h.FillN(len(a), a, _w_chunk[:len(a)])
+
+# Cling-compiled C++ filler for the per-hit TTree — avoids a slow Python loop
+ROOT.gInterpreter.Declare("""
+void _vmm_fill_hits(TTree* t,
+                    const unsigned char*  fec_a,
+                    const unsigned char*  vmm_a,
+                    const unsigned char*  ch_a,
+                    const unsigned short* adc_a,
+                    const unsigned char*  ot_a,
+                    const unsigned int*   time_a,
+                    long long n)
+{
+    unsigned char  fec = 0, vmm = 0, ch = 0, ot = 0;
+    unsigned short adc = 0;
+    unsigned int   ts  = 0;
+    t->Branch("fec",            &fec, "fec/b");
+    t->Branch("vmm",            &vmm, "vmm/b");
+    t->Branch("ch",             &ch,  "ch/b");
+    t->Branch("adc",            &adc, "adc/s");
+    t->Branch("over_threshold", &ot,  "over_threshold/b");
+    t->Branch("time",           &ts,  "time/i");
+    for (long long i = 0; i < n; ++i) {
+        fec = fec_a[i]; vmm = vmm_a[i]; ch  = ch_a[i];
+        adc = adc_a[i]; ot  = ot_a[i];  ts  = time_a[i];
+        t->Fill();
+    }
+}
+""")
+
+import datetime
+import ctypes
 
 root_path = os.path.join(out_dir, f"{base}.root")
 rf = ROOT.TFile(root_path, "RECREATE")
 
-# Summary: total hits per VMM (one bin per VMM, labelled)
+# --- hits_parameters: one-entry TTree storing run parameters and statistics ---
+t_params = ROOT.TTree("hits_parameters", "Run parameters and statistics")
+
+_sbuf = {}  # string buffers must stay alive until Fill()
+_ibuf = {}  # int buffers must stay alive until Fill()
+
+def _sbranch(name, val, maxlen=512):
+    buf = ctypes.create_string_buffer(str(val).encode(), maxlen)
+    _sbuf[name] = buf
+    t_params.Branch(name, buf, f"{name}/C")
+
+def _ibranch(name, val):
+    buf = array.array('i', [int(val)])
+    _ibuf[name] = buf
+    t_params.Branch(name, buf, f"{name}/I")
+
+_sbranch("input_file",        os.path.abspath(pcap_file))
+_sbranch("created",           datetime.datetime.now().isoformat(timespec='seconds'))
+_sbranch("fec_ips",           ", ".join(sorted(src_ips)))
+_sbranch("src_ip_override",   str(SRC_IP_OVERRIDE))
+_ibranch("probe_packets",     PROBE_PACKETS)
+_ibranch("n_packets",         pkt_count)
+_ibranch("n_vm3_packets",     vm3_count)
+_ibranch("n_hits_total",      len(hits))
+_ibranch("n_vmm",             n_vmm)
+_sbranch("vmm_ids",           ", ".join(str(v) for v in vmm_ids))
+_ibranch("frame_counter_min", t_min)
+_ibranch("frame_counter_max", t_max)
+_ibranch("adc_bins",          ADC_BINS)
+_ibranch("adc_min",           ADC_MIN)
+_ibranch("adc_max",           ADC_MAX)
+_ibranch("ch_bins",           CH_BINS)
+_ibranch("ch_min",            CH_MIN)
+_ibranch("ch_max",            CH_MAX)
+_ibranch("time_bins",         TIME_BINS)
+
+# hits_per_vmm[32]: indexed directly by VMM ID; -1 means VMM not present in this run
+_hpv = array.array('i', [-1] * 32)
+for v in vmm_ids:
+    _hpv[v] = int((hits.vmm == v).sum())
+t_params.Branch("hits_per_vmm", _hpv, "hits_per_vmm[32]/I")
+
+t_params.Fill()
+t_params.Write()
+
+# --- Summary: total hits per VMM (one bin per VMM, labelled) ---
 h_hits = ROOT.TH1F("hits_per_vmm", "Total hits per VMM;VMM ID;Hits",
                    n_vmm, -0.5, n_vmm - 0.5)
 for i, v in enumerate(vmm_ids):
@@ -292,15 +412,15 @@ for v in vmm_ids:
     adc_ot     = vdata.loc[ vdata.over_threshold, 'adc'].values
     adc_not_ot = vdata.loc[~vdata.over_threshold, 'adc'].values
 
-    h_adc = ROOT.TH1F("adc", f"ADC — VMM {v};ADC;Counts", 100, 0, 1024)
+    h_adc = ROOT.TH1F("adc", f"ADC — VMM {v};ADC;Counts", ADC_BINS, ADC_MIN, ADC_MAX)
     _fill1d(h_adc, adc_all)
     h_adc.Write()
 
-    h_adc_ot = ROOT.TH1F("adc_ot", f"ADC (OT) — VMM {v};ADC;Counts", 100, 0, 1024)
+    h_adc_ot = ROOT.TH1F("adc_ot", f"ADC (OT) — VMM {v};ADC;Counts", ADC_BINS, ADC_MIN, ADC_MAX)
     _fill1d(h_adc_ot, adc_ot)
     h_adc_ot.Write()
 
-    h_adc_not_ot = ROOT.TH1F("adc_not_ot", f"ADC (not OT) — VMM {v};ADC;Counts", 100, 0, 1024)
+    h_adc_not_ot = ROOT.TH1F("adc_not_ot", f"ADC (not OT) — VMM {v};ADC;Counts", ADC_BINS, ADC_MIN, ADC_MAX)
     _fill1d(h_adc_not_ot, adc_not_ot)
     h_adc_not_ot.Write()
 
@@ -311,14 +431,43 @@ for v in vmm_ids:
     h_ot.GetXaxis().SetBinLabel(2, "OT")
     h_ot.Write()
 
-    h_ch = ROOT.TH1F("ch_occ", f"Channel occupancy — VMM {v};Channel;Counts", 64, 0, 64)
+    h_ch = ROOT.TH1F("ch_occ", f"Channel occupancy — VMM {v};Channel;Counts", CH_BINS, CH_MIN, CH_MAX)
     _fill1d(h_ch, vdata['ch'].values.astype(np.float64))
     h_ch.Write()
 
     h_time = ROOT.TH1F("time", f"Hit rate over time — VMM {v};Frame counter;Hits per bin",
-                       200, t_min, t_max)
+                       TIME_BINS, t_min, t_max)
     _fill1d(h_time, vdata['time'].values.astype(np.float64))
     h_time.Write()
+
+    h_adc_ch = ROOT.TH2F("adc_vs_ch", f"ADC vs channel — VMM {v};Channel;ADC;Hits",
+                          CH_BINS, CH_MIN, CH_MAX, ADC_BINS, ADC_MIN, ADC_MAX)
+    h2, _, _ = np.histogram2d(
+        vdata['ch'].values.astype(np.float64),
+        vdata['adc'].values.astype(np.float64),
+        bins=[CH_BINS, ADC_BINS], range=[[CH_MIN, CH_MAX], [ADC_MIN, ADC_MAX]],
+    )
+    for ix in range(64):
+        for iy in range(100):
+            if h2[ix, iy] > 0:
+                h_adc_ch.SetBinContent(ix + 1, iy + 1, h2[ix, iy])
+    h_adc_ch.Write()
+    del vdata, adc_all, adc_ot, adc_not_ot
+
+# --- hits TTree: one row per hit, written into rf via Cling-compiled C++ filler ---
+rf.cd()
+_hits_tree = ROOT.TTree("hits", "Per-hit data")
+ROOT._vmm_fill_hits(
+    _hits_tree,
+    np.ascontiguousarray(hits['fec'].values,            dtype=np.uint8),
+    np.ascontiguousarray(hits['vmm'].values,            dtype=np.uint8),
+    np.ascontiguousarray(hits['ch'].values,             dtype=np.uint8),
+    np.ascontiguousarray(hits['adc'].values,            dtype=np.uint16),
+    np.ascontiguousarray(hits['over_threshold'].values, dtype=np.uint8),
+    np.ascontiguousarray(hits['time'].values,           dtype=np.uint32),
+    len(hits),
+)
+_hits_tree.Write()
 
 rf.Close()
 print(f"ROOT file: {root_path}")
