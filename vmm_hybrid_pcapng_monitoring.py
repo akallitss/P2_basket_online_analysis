@@ -275,7 +275,10 @@ else:
 # ---- Live monitoring mode ------------------------------------------------
 if _args.live:
     run_live(pcap_file, src_ips, update_interval=_args.update_interval)
-    sys.exit(0)
+    print("\nProceeding with batch QA analysis on the same file...\n")
+    # Switch matplotlib and ROOT back to non-interactive/batch mode
+    plt.switch_backend('Agg')
+    ROOT.gROOT.SetBatch(True)
 # --------------------------------------------------------------------------
 
 # Memory-efficient typed arrays (no Python object overhead)
