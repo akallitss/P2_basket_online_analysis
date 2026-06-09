@@ -44,15 +44,20 @@ _user = os.getlogin()
 os.environ.setdefault('XDG_CACHE_HOME', f'/tmp/.cache-{_user}')
 os.environ.setdefault('MPLCONFIGDIR', f'/tmp/matplotlib-{_user}')
 
+import time
 import numpy as np
 import pandas as pd
+import argparse
+import datetime
+import ctypes
 import matplotlib
-matplotlib.use('Agg')
+# Live mode needs an interactive backend; batch mode uses the non-display Agg backend.
+matplotlib.use('TkAgg' if '--live' in sys.argv else 'Agg')
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 from scapy.all import PcapReader, UDP, IP
 import ROOT
-ROOT.gROOT.SetBatch(True)
+ROOT.gROOT.SetBatch('--live' not in sys.argv)
 
 #########################################
 # AUTO-DETECT FEC SOURCE IPs
@@ -101,9 +106,122 @@ def parse_block(block: bytes, frame_counter: int, fec_id: int,
             tdc_buf.append(d2 & 0xFF)            # bits 7-0 of d2
 
 #########################################
+# LIVE-MONITORING HELPERS
+#########################################
+def follow_pcap(filename):
+    """Yield packets from a growing pcapng file indefinitely (tail -f style)."""
+    file_offset = 0
+    while True:
+        try:
+            with open(filename, "rb") as f:
+                f.seek(file_offset)
+                reader = PcapReader(f)
+                for pkt in reader:
+                    yield pkt
+                file_offset = f.tell()
+        except FileNotFoundError:
+            pass
+        time.sleep(0.1)
+
+
+def run_live(pcap_file, src_ips, update_interval=2.0):
+    """
+    Continuously follow a growing pcapng file and display live hit-rate-per-channel
+    plots for every active VMM. Press Ctrl-C to stop.
+    """
+    vmm_counts  = {}   # vmm_id -> np.ndarray(64, int64) — cumulative channel hits
+    vmm_hits    = {}   # vmm_id -> total hits (for per-VMM rate label)
+    total_hits  = 0
+    t_start     = time.time()
+    t_last      = t_start
+
+    fig         = None
+    axes_map    = {}   # vmm_id -> Axes
+    n_vmm_last  = 0    # detect when a new VMM appears so we rebuild the figure
+
+    plt.ion()
+    print(f"Live monitoring: {pcap_file}")
+    print(f"Update interval: {update_interval}s   |   Press Ctrl-C to stop\n")
+
+    try:
+        for pkt in follow_pcap(pcap_file):
+            if UDP not in pkt or IP not in pkt:
+                continue
+            if pkt[IP].src not in src_ips:
+                continue
+            payload = bytes(pkt[UDP].payload)
+            if len(payload) < 22 or payload[4:7] != b'VM3':
+                continue
+            for j in range(0, len(payload) - 22, 6):
+                d1, d2 = struct.unpack_from('>IH', payload, j + 16)
+                if d2 & 0x8000:
+                    vmm = (d1 >> 22) & 0x1F
+                    ch  = (d2 >> 8) & 0x3F
+                    if vmm not in vmm_counts:
+                        vmm_counts[vmm] = np.zeros(64, dtype=np.int64)
+                        vmm_hits[vmm]   = 0
+                    vmm_counts[vmm][ch] += 1
+                    vmm_hits[vmm]       += 1
+                    total_hits          += 1
+
+            now = time.time()
+            if now - t_last < update_interval:
+                continue
+            t_last   = now
+            elapsed  = now - t_start
+            vmm_list = sorted(vmm_counts.keys())
+            n        = len(vmm_list)
+            if n == 0:
+                continue
+
+            # Rebuild figure if a new VMM appeared
+            if n != n_vmm_last:
+                if fig is not None:
+                    plt.close(fig)
+                ncols = min(4, n)
+                nrows = (n + ncols - 1) // ncols
+                fig, ax_arr = plt.subplots(nrows, ncols,
+                                           figsize=(5 * ncols, 4 * nrows),
+                                           squeeze=False)
+                axes_map = {v: ax_arr[i // ncols][i % ncols] for i, v in enumerate(vmm_list)}
+                for i in range(n, nrows * ncols):
+                    ax_arr[i // ncols][i % ncols].set_visible(False)
+                n_vmm_last = n
+
+            rate = total_hits / elapsed if elapsed > 0 else 0
+            fig.suptitle(
+                f"VMM Online Monitoring  |  {os.path.basename(pcap_file)}\n"
+                f"Total: {total_hits:,} hits  |  Rate: {rate:.1f} hits/s  |  "
+                f"Elapsed: {elapsed:.0f}s",
+                fontsize=11,
+            )
+
+            for v in vmm_list:
+                ax     = axes_map[v]
+                counts = vmm_counts[v]
+                ax.cla()
+                ax.bar(range(64), counts, color='steelblue', alpha=0.8, width=1.0)
+                v_rate = vmm_hits[v] / elapsed if elapsed > 0 else 0
+                ax.set_title(f"VMM {v}  |  {vmm_hits[v]:,} hits  |  {v_rate:.1f} hits/s",
+                             fontsize=9)
+                ax.set_xlabel("Channel")
+                ax.set_ylabel("Hits")
+                ax.set_xlim(-0.5, 63.5)
+
+            fig.tight_layout()
+            plt.pause(0.05)
+
+    except KeyboardInterrupt:
+        print("\nMonitoring stopped.")
+    finally:
+        if fig is not None:
+            plt.ioff()
+            plt.show()
+
+
+#########################################
 # MAIN
 #########################################
-import argparse
 
 _ap = argparse.ArgumentParser(
     description="VMM3 hybrid diagnostic: parse a pcapng capture and produce QA plots + ROOT output."
@@ -111,25 +229,19 @@ _ap = argparse.ArgumentParser(
 _ap.add_argument("pcap_file", help="Input .pcapng file")
 _ap.add_argument("--no-hits-tree", action="store_true",
                  help="Skip writing the per-hit 'hits' TTree (saves time and disk for large files)")
+_ap.add_argument("--live", action="store_true",
+                 help="Live monitoring mode: follow a growing pcapng and display "
+                      "hit-rate-per-channel for each active VMM (no ROOT output)")
+_ap.add_argument("--update-interval", type=float, default=2.0, metavar="SECONDS",
+                 help="Plot refresh interval in seconds for --live mode (default: 2.0)")
 _args = _ap.parse_args()
 
-pcap_file    = _args.pcap_file
+pcap_file      = _args.pcap_file
 save_hits_tree = not _args.no_hits_tree
 
 if not os.path.isfile(pcap_file):
     print(f"File not found: {pcap_file}")
     sys.exit(1)
-
-# Memory-efficient typed arrays (no Python object overhead)
-fec_buf    = array.array('B')   # uint8
-vmm_buf    = array.array('B')   # uint8
-time_buf   = array.array('I')   # uint32 ('I'=unsigned int, always 4 bytes; 'L' is 8 bytes on 64-bit Linux)
-ch_buf     = array.array('B')   # uint8
-adc_buf    = array.array('H')   # uint16
-ot_buf     = array.array('B')   # uint8 (0/1)
-offset_buf = array.array('b')   # int8  (-16 to +15, 5-bit signed)
-bcid_buf   = array.array('H')   # uint16 (0-4095)
-tdc_buf    = array.array('B')   # uint8  (0-255)
 
 if SRC_IP_OVERRIDE:
     src_ips = {SRC_IP_OVERRIDE}
@@ -142,6 +254,23 @@ else:
         sys.exit(1)
     src_ips = set(detected.keys())
     print(f"Auto-detected FEC IP(s): {', '.join(sorted(src_ips))}")
+
+# ---- Live monitoring mode ------------------------------------------------
+if _args.live:
+    run_live(pcap_file, src_ips, update_interval=_args.update_interval)
+    sys.exit(0)
+# --------------------------------------------------------------------------
+
+# Memory-efficient typed arrays (no Python object overhead)
+fec_buf    = array.array('B')   # uint8
+vmm_buf    = array.array('B')   # uint8
+time_buf   = array.array('I')   # uint32 ('I'=unsigned int, always 4 bytes; 'L' is 8 bytes on 64-bit Linux)
+ch_buf     = array.array('B')   # uint8
+adc_buf    = array.array('H')   # uint16
+ot_buf     = array.array('B')   # uint8 (0/1)
+offset_buf = array.array('b')   # int8  (-16 to +15, 5-bit signed)
+bcid_buf   = array.array('H')   # uint16 (0-4095)
+tdc_buf    = array.array('B')   # uint8  (0-255)
 
 print(f"Reading: {pcap_file}")
 pkt_count = 0
@@ -424,8 +553,6 @@ void _vmm_fill_hits(TTree* t,
 }
 """)
 
-import datetime
-import ctypes
 
 root_path = os.path.join(out_dir, f"{base}.root")
 rf = ROOT.TFile(root_path, "RECREATE")
