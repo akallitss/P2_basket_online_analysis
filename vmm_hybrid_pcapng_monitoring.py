@@ -16,6 +16,9 @@ hits DataFrame columns:
     ch             : channel number (0-63)
     adc            : ADC value (0-1023)
     over_threshold : over-threshold flag (bool)
+    offset         : 5-bit signed offset (-16 to +15)
+    bcid           : bunch-crossing ID (0-4095, 12-bit)
+    tdc            : TDC fine-timing value (0-255, 8-bit)
 """
 
 import sys
@@ -79,7 +82,8 @@ def detect_fec_ips(filename, n_probe=PROBE_PACKETS):
 # PARSE ONE UDP PAYLOAD BLOCK
 #########################################
 def parse_block(block: bytes, frame_counter: int, fec_id: int,
-                fec_buf, vmm_buf, time_buf, ch_buf, adc_buf, ot_buf):
+                fec_buf, vmm_buf, time_buf, ch_buf, adc_buf, ot_buf,
+                offset_buf, bcid_buf, tdc_buf):
     if len(block) < 22 or block[4:7] != b'VM3':
         return
     for i in range(0, len(block) - 22, 6):
@@ -91,6 +95,10 @@ def parse_block(block: bytes, frame_counter: int, fec_id: int,
             ch_buf.append((d2 >> 8) & 0x3F)     # bits 13-8 of d2
             adc_buf.append((d1 >> 12) & 0x3FF)  # bits 21-12 of d1
             ot_buf.append((d2 >> 14) & 0x1)     # bit 14 of d2
+            raw_off = (d1 >> 27) & 0x1F          # bits 31-27 of d1 (5-bit signed)
+            offset_buf.append(raw_off if raw_off < 16 else raw_off - 32)
+            bcid_buf.append(d1 & 0xFFF)          # bits 11-0 of d1
+            tdc_buf.append(d2 & 0xFF)            # bits 7-0 of d2
 
 #########################################
 # MAIN
@@ -105,12 +113,15 @@ if not os.path.isfile(pcap_file):
     sys.exit(1)
 
 # Memory-efficient typed arrays (no Python object overhead)
-fec_buf  = array.array('B')   # uint8
-vmm_buf  = array.array('B')   # uint8
-time_buf = array.array('I')   # uint32 ('I'=unsigned int, always 4 bytes; 'L' is 8 bytes on 64-bit Linux)
-ch_buf   = array.array('B')   # uint8
-adc_buf  = array.array('H')   # uint16
-ot_buf   = array.array('B')   # uint8 (0/1)
+fec_buf    = array.array('B')   # uint8
+vmm_buf    = array.array('B')   # uint8
+time_buf   = array.array('I')   # uint32 ('I'=unsigned int, always 4 bytes; 'L' is 8 bytes on 64-bit Linux)
+ch_buf     = array.array('B')   # uint8
+adc_buf    = array.array('H')   # uint16
+ot_buf     = array.array('B')   # uint8 (0/1)
+offset_buf = array.array('b')   # int8  (-16 to +15, 5-bit signed)
+bcid_buf   = array.array('H')   # uint16 (0-4095)
+tdc_buf    = array.array('B')   # uint8  (0-255)
 
 if SRC_IP_OVERRIDE:
     src_ips = {SRC_IP_OVERRIDE}
@@ -136,7 +147,8 @@ with PcapReader(pcap_file) as reader:
             fec_id = int(pkt[IP].src.split('.')[-1])
             n_before = len(fec_buf)
             parse_block(payload, fc, fec_id,
-                        fec_buf, vmm_buf, time_buf, ch_buf, adc_buf, ot_buf)
+                        fec_buf, vmm_buf, time_buf, ch_buf, adc_buf, ot_buf,
+                        offset_buf, bcid_buf, tdc_buf)
             if len(fec_buf) > n_before:
                 vm3_count += 1
         pkt_count += 1
@@ -147,14 +159,17 @@ print(f"\nDone: {pkt_count} packets | {vm3_count} VM3 packets | {len(fec_buf):,}
 
 # Build DataFrame with compact dtypes
 hits = pd.DataFrame({
-    'fec':            np.frombuffer(fec_buf,  dtype=np.uint8).copy(),
-    'vmm':            np.frombuffer(vmm_buf,  dtype=np.uint8).copy(),
-    'time':           np.frombuffer(time_buf, dtype=np.uint32).copy(),
-    'ch':             np.frombuffer(ch_buf,   dtype=np.uint8).copy(),
-    'adc':            np.frombuffer(adc_buf,  dtype=np.uint16).copy(),
-    'over_threshold': np.frombuffer(ot_buf,   dtype=np.uint8).astype(bool).copy(),
+    'fec':            np.frombuffer(fec_buf,    dtype=np.uint8).copy(),
+    'vmm':            np.frombuffer(vmm_buf,    dtype=np.uint8).copy(),
+    'time':           np.frombuffer(time_buf,   dtype=np.uint32).copy(),
+    'ch':             np.frombuffer(ch_buf,     dtype=np.uint8).copy(),
+    'adc':            np.frombuffer(adc_buf,    dtype=np.uint16).copy(),
+    'over_threshold': np.frombuffer(ot_buf,     dtype=np.uint8).astype(bool).copy(),
+    'offset':         np.frombuffer(offset_buf, dtype=np.int8).copy(),
+    'bcid':           np.frombuffer(bcid_buf,   dtype=np.uint16).copy(),
+    'tdc':            np.frombuffer(tdc_buf,    dtype=np.uint8).copy(),
 })
-del fec_buf, vmm_buf, time_buf, ch_buf, adc_buf, ot_buf
+del fec_buf, vmm_buf, time_buf, ch_buf, adc_buf, ot_buf, offset_buf, bcid_buf, tdc_buf
 
 mem_mb = hits.memory_usage(deep=True).sum() / 1e6
 print(f"DataFrame memory: {mem_mb:.1f} MB")
@@ -166,9 +181,12 @@ for v in sorted(hits.vmm.unique()):
 #########################################
 # HISTOGRAM PARAMETERS
 #########################################
-ADC_BINS = 100;  ADC_MIN = 0;  ADC_MAX = 1024
-CH_BINS  = 64;   CH_MIN  = 0;  CH_MAX  = 64
-TIME_BINS = 200
+ADC_BINS    = 100; ADC_MIN    = 0;   ADC_MAX    = 1024
+CH_BINS     = 64;  CH_MIN     = 0;   CH_MAX     = 64
+TIME_BINS   = 200
+BCID_BINS   = 100; BCID_MIN   = 0;   BCID_MAX   = 4096
+TDC_BINS    = 64;  TDC_MIN    = 0;   TDC_MAX    = 256
+OFFSET_BINS = 32;  OFFSET_MIN = -16; OFFSET_MAX = 16
 
 #########################################
 # PLOTS
@@ -290,6 +308,51 @@ _save(fig_ot,     f"{base}_ot.png")
 _save(fig_ch,     f"{base}_chno.png")
 _save(fig_sum,    f"{base}_hits_per_vmm.png")
 
+# --- BCID distribution ---
+fig_bcid, axes_bcid = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows), squeeze=False)
+fig_bcid.suptitle("BCID distribution per VMM", fontsize=14)
+for idx, v in enumerate(vmm_ids):
+    ax   = axes_bcid[idx // ncols][idx % ncols]
+    data = hits.loc[hits.vmm == v, 'bcid']
+    ax.hist(data, bins=BCID_BINS, range=(BCID_MIN, BCID_MAX), color='teal', alpha=0.8)
+    ax.set_title(f"VMM {v}  ({len(data):,} hits)")
+    ax.set_xlabel("BCID")
+    ax.set_ylabel("Counts")
+for idx in range(n_vmm, nrows * ncols):
+    axes_bcid[idx // ncols][idx % ncols].set_visible(False)
+fig_bcid.tight_layout()
+_save(fig_bcid, f"{base}_bcid.png")
+
+# --- TDC distribution ---
+fig_tdc, axes_tdc = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows), squeeze=False)
+fig_tdc.suptitle("TDC distribution per VMM", fontsize=14)
+for idx, v in enumerate(vmm_ids):
+    ax   = axes_tdc[idx // ncols][idx % ncols]
+    data = hits.loc[hits.vmm == v, 'tdc']
+    ax.hist(data, bins=TDC_BINS, range=(TDC_MIN, TDC_MAX), color='darkcyan', alpha=0.8)
+    ax.set_title(f"VMM {v}  ({len(data):,} hits)")
+    ax.set_xlabel("TDC")
+    ax.set_ylabel("Counts")
+for idx in range(n_vmm, nrows * ncols):
+    axes_tdc[idx // ncols][idx % ncols].set_visible(False)
+fig_tdc.tight_layout()
+_save(fig_tdc, f"{base}_tdc.png")
+
+# --- Offset distribution ---
+fig_offset, axes_offset = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows), squeeze=False)
+fig_offset.suptitle("Offset distribution per VMM (5-bit signed)", fontsize=14)
+for idx, v in enumerate(vmm_ids):
+    ax   = axes_offset[idx // ncols][idx % ncols]
+    data = hits.loc[hits.vmm == v, 'offset']
+    ax.hist(data, bins=OFFSET_BINS, range=(OFFSET_MIN, OFFSET_MAX), color='saddlebrown', alpha=0.8)
+    ax.set_title(f"VMM {v}  ({len(data):,} hits)")
+    ax.set_xlabel("Offset (signed)")
+    ax.set_ylabel("Counts")
+for idx in range(n_vmm, nrows * ncols):
+    axes_offset[idx // ncols][idx % ncols].set_visible(False)
+fig_offset.tight_layout()
+_save(fig_offset, f"{base}_offset.png")
+
 # --- Time distribution: one PNG per VMM (built and saved immediately to avoid accumulation) ---
 t_min, t_max = int(hits.time.min()), int(hits.time.max())
 for v in vmm_ids:
@@ -326,20 +389,28 @@ void _vmm_fill_hits(TTree* t,
                     const unsigned short* adc_a,
                     const unsigned char*  ot_a,
                     const unsigned int*   time_a,
+                    const unsigned char*  off_a,
+                    const unsigned short* bcid_a,
+                    const unsigned char*  tdc_a,
                     long long n)
 {
-    unsigned char  fec = 0, vmm = 0, ch = 0, ot = 0;
-    unsigned short adc = 0;
+    unsigned char  fec = 0, vmm = 0, ch = 0, ot = 0, tdc = 0;
+    unsigned short adc = 0, bcid = 0;
     unsigned int   ts  = 0;
-    t->Branch("fec",            &fec, "fec/b");
-    t->Branch("vmm",            &vmm, "vmm/b");
-    t->Branch("ch",             &ch,  "ch/b");
-    t->Branch("adc",            &adc, "adc/s");
-    t->Branch("over_threshold", &ot,  "over_threshold/b");
-    t->Branch("time",           &ts,  "time/i");
+    signed char    off = 0;
+    t->Branch("fec",            &fec,  "fec/b");
+    t->Branch("vmm",            &vmm,  "vmm/b");
+    t->Branch("ch",             &ch,   "ch/b");
+    t->Branch("adc",            &adc,  "adc/s");
+    t->Branch("over_threshold", &ot,   "over_threshold/b");
+    t->Branch("time",           &ts,   "time/i");
+    t->Branch("offset",         &off,  "offset/B");
+    t->Branch("bcid",           &bcid, "bcid/s");
+    t->Branch("tdc",            &tdc,  "tdc/b");
     for (long long i = 0; i < n; ++i) {
-        fec = fec_a[i]; vmm = vmm_a[i]; ch  = ch_a[i];
-        adc = adc_a[i]; ot  = ot_a[i];  ts  = time_a[i];
+        fec  = fec_a[i];  vmm  = vmm_a[i]; ch   = ch_a[i];
+        adc  = adc_a[i];  ot   = ot_a[i];  ts   = time_a[i];
+        off  = (signed char)off_a[i]; bcid = bcid_a[i]; tdc  = tdc_a[i];
         t->Fill();
     }
 }
@@ -386,6 +457,15 @@ _ibranch("ch_bins",           CH_BINS)
 _ibranch("ch_min",            CH_MIN)
 _ibranch("ch_max",            CH_MAX)
 _ibranch("time_bins",         TIME_BINS)
+_ibranch("bcid_bins",         BCID_BINS)
+_ibranch("bcid_min",          BCID_MIN)
+_ibranch("bcid_max",          BCID_MAX)
+_ibranch("tdc_bins",          TDC_BINS)
+_ibranch("tdc_min",           TDC_MIN)
+_ibranch("tdc_max",           TDC_MAX)
+_ibranch("offset_bins",       OFFSET_BINS)
+_ibranch("offset_min",        OFFSET_MIN)
+_ibranch("offset_max",        OFFSET_MAX)
 
 # hits_per_vmm[32]: indexed directly by VMM ID; -1 means VMM not present in this run
 _hpv = array.array('i', [-1] * 32)
@@ -452,6 +532,20 @@ for v in vmm_ids:
             if h2[ix, iy] > 0:
                 h_adc_ch.SetBinContent(ix + 1, iy + 1, h2[ix, iy])
     h_adc_ch.Write()
+
+    h_bcid = ROOT.TH1F("bcid", f"BCID — VMM {v};BCID;Counts", BCID_BINS, BCID_MIN, BCID_MAX)
+    _fill1d(h_bcid, vdata['bcid'].values.astype(np.float64))
+    h_bcid.Write()
+
+    h_tdc = ROOT.TH1F("tdc", f"TDC — VMM {v};TDC;Counts", TDC_BINS, TDC_MIN, TDC_MAX)
+    _fill1d(h_tdc, vdata['tdc'].values.astype(np.float64))
+    h_tdc.Write()
+
+    h_offset = ROOT.TH1F("offset", f"Offset — VMM {v};Offset (signed);Counts",
+                          OFFSET_BINS, OFFSET_MIN, OFFSET_MAX)
+    _fill1d(h_offset, vdata['offset'].values.astype(np.float64))
+    h_offset.Write()
+
     del vdata, adc_all, adc_ot, adc_not_ot
 
 # --- hits TTree: one row per hit, written into rf via Cling-compiled C++ filler ---
@@ -465,6 +559,9 @@ ROOT._vmm_fill_hits(
     np.ascontiguousarray(hits['adc'].values,            dtype=np.uint16),
     np.ascontiguousarray(hits['over_threshold'].values, dtype=np.uint8),
     np.ascontiguousarray(hits['time'].values,           dtype=np.uint32),
+    np.ascontiguousarray(hits['offset'].values.view(np.uint8)),
+    np.ascontiguousarray(hits['bcid'].values,           dtype=np.uint16),
+    np.ascontiguousarray(hits['tdc'].values,            dtype=np.uint8),
     len(hits),
 )
 _hits_tree.Write()

@@ -33,6 +33,9 @@ For every UDP packet from a detected FEC IP the script reads:
 | `adc` | 10 bits | ADC value (0–1023) |
 | `over_threshold` | 1 bit | over-threshold flag |
 | `time` | 32 bits | frame counter at the packet header (proxy for time) |
+| `offset` | 5 bits (signed) | timing offset, two's-complement (−16 to +15) |
+| `bcid` | 12 bits | bunch-crossing ID (0–4095) |
+| `tdc` | 8 bits | TDC fine-timing value (0–255) |
 
 Each UDP payload has the following structure:
 
@@ -43,12 +46,15 @@ payload bytes
  ├─ bytes  7–15   header (skipped)
  └─ bytes 16+     hits, 6 bytes each, packed at the bit level
       ├─ d1  (bytes +0 to +3, 32 bits)
+      │    bits  0– 4  →  offset  (5-bit signed, two's-complement)
       │    bits  5– 9  →  VMM ID  (0–31)
       │    bits 10–19  →  ADC     (0–1023)
+      │    bits 20–31  →  BCID    (0–4095)
       └─ d2  (bytes +4 to +5, 16 bits)
            bit   0     →  valid flag  (hit ignored if 0)
            bit   1     →  over-threshold flag
            bits  2– 7  →  channel     (0–63)
+           bits  8–15  →  TDC         (0–255)
 ```
 
 One packet can carry many hits back-to-back; each valid hit becomes one row
@@ -72,6 +78,9 @@ All outputs are saved under `qa_plots/<input_basename>/` next to the input file.
 | `<base>_chno.png` | Channel occupancy (0–63), one panel per VMM |
 | `<base>_hits_per_vmm.png` | Bar chart of total hits per VMM |
 | `<base>_time_vmm<N>.png` | Hit rate vs frame counter for VMM N (one file per VMM) |
+| `<base>_bcid.png` | BCID distribution (0–4095), one panel per VMM |
+| `<base>_tdc.png` | TDC distribution (0–255), one panel per VMM |
+| `<base>_offset.png` | Offset distribution (−16 to +15, 5-bit signed), one panel per VMM |
 
 #### ROOT file
 
@@ -113,6 +122,15 @@ same histogram binning in downstream analysis:
 | `ch_min` | `Int_t` | channel histogram lower edge |
 | `ch_max` | `Int_t` | channel histogram upper edge |
 | `time_bins` | `Int_t` | number of time histogram bins |
+| `bcid_bins` | `Int_t` | number of BCID histogram bins |
+| `bcid_min` | `Int_t` | BCID histogram lower edge |
+| `bcid_max` | `Int_t` | BCID histogram upper edge |
+| `tdc_bins` | `Int_t` | number of TDC histogram bins |
+| `tdc_min` | `Int_t` | TDC histogram lower edge |
+| `tdc_max` | `Int_t` | TDC histogram upper edge |
+| `offset_bins` | `Int_t` | number of offset histogram bins |
+| `offset_min` | `Int_t` | offset histogram lower edge |
+| `offset_max` | `Int_t` | offset histogram upper edge |
 | `hits_per_vmm[32]` | `Int_t[32]` | hits per VMM slot; `-1` if VMM not present |
 
 ##### `hits` TTree (1 entry per hit)
@@ -128,6 +146,9 @@ analysis without re-parsing the pcapng:
 | `adc` | `UShort_t` | 0–1023 | ADC value |
 | `over_threshold` | `UChar_t` | 0/1 | over-threshold flag |
 | `time` | `UInt_t` | 0–2³²−1 | frame counter (proxy for time) |
+| `offset` | `Char_t` | −16–+15 | 5-bit signed timing offset |
+| `bcid` | `UShort_t` | 0–4095 | bunch-crossing ID |
+| `tdc` | `UChar_t` | 0–255 | TDC fine-timing value |
 
 Example usage in a ROOT macro:
 
@@ -159,6 +180,9 @@ hits->Draw(Form("adc>>h(%d,%d,%d)", adc_bins, adc_min, adc_max),
 | `ch_occ` | `TH1F` | channel occupancy |
 | `time` | `TH1F` | hit rate vs frame counter |
 | `adc_vs_ch` | `TH2F` | ADC (y) vs channel (x) — same data as the 2-D PNG |
+| `bcid` | `TH1F` | BCID distribution |
+| `tdc` | `TH1F` | TDC distribution |
+| `offset` | `TH1F` | offset distribution (signed) |
 
 ---
 
@@ -194,7 +218,7 @@ is built from those buffers, the originals are immediately released:
 
 ```python
 hits = pd.DataFrame({...})
-del fec_buf, vmm_buf, time_buf, ch_buf, adc_buf, ot_buf
+del fec_buf, vmm_buf, time_buf, ch_buf, adc_buf, ot_buf, offset_buf, bcid_buf, tdc_buf
 ```
 
 This frees roughly one full copy of the hit data (~1 GB at 100 M hits) as soon
@@ -365,6 +389,9 @@ After parsing, hits are stored in a `pd.DataFrame` with the following columns:
 | `ch` | uint8 | channel number (0–63) |
 | `adc` | uint16 | ADC value (0–1023) |
 | `over_threshold` | bool | over-threshold flag |
+| `offset` | int8 | 5-bit signed timing offset (−16 to +15) |
+| `bcid` | uint16 | bunch-crossing ID (0–4095) |
+| `tdc` | uint8 | TDC fine-timing value (0–255) |
 
 This DataFrame is available in memory after the script finishes, so the script
 can be imported and extended for custom analysis.
