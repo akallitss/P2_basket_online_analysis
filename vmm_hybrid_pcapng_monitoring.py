@@ -28,6 +28,9 @@ hits DataFrame columns:
     abs_time_ns    : absolute time = srs_timestamp * 25 + timestamp_ns (ns)
     trigger_time   : 42-bit external trigger timestamp (TRG format only; 25 ns ticks; 0 in SRS mode)
     trigger_counter: trigger event counter (TRG format only; 0 in SRS mode)
+    hit_valid      : True if offset is within the valid range for the selected format
+                     SRS/TRG (new SRS format): valid offsets are -1 to +15; anything outside is flagged False
+                     Old SRS format (raw 0-31 unsigned) is not yet a separate mode — see --format
 """
 
 import sys
@@ -487,6 +490,12 @@ _trg_ctr  = np.frombuffer(trg_ctr_buf,  dtype=np.uint16).copy()
 _abs_time_ns = _srs_ts.astype(np.float64) * 25.0 + _timestamp_ns
 _adc_cal  = (_a_slp * _adc_raw.astype(np.float64) + _a_off).astype(np.float32)
 
+# Offset validity flag — new SRS format (and TRG) valid range is -1 to +15.
+# Anything with offset < -1 (raw 16-30) is outside the firmware specification
+# and indicates abnormal FEC behaviour. All values are kept in the DataFrame;
+# hit_valid=False lets the user apply or inspect the cut downstream.
+_hit_valid = (_offset >= np.int8(-1))
+
 hits = pd.DataFrame({
     'fec':             np.frombuffer(fec_buf,      dtype=np.uint8).copy(),
     'vmm':             _vmm,
@@ -505,16 +514,34 @@ hits = pd.DataFrame({
     'abs_time_ns':     _abs_time_ns,
     'trigger_time':    _trg_time,
     'trigger_counter': _trg_ctr,
+    'hit_valid':       _hit_valid,
 })
 del (fec_buf, vmm_buf, time_buf, udp_ts_buf, overflow_buf, ch_buf, adc_buf, ot_buf,
      offset_buf, bcid_buf, tdc_buf, srs_ts_buf, trg_time_buf, trg_ctr_buf)
 
 mem_mb = hits.memory_usage(deep=True).sum() / 1e6
 print(f"DataFrame memory: {mem_mb:.1f} MB")
+
+# Report anomalous hits
+_n_invalid = int((~hits['hit_valid']).sum())
+if _n_invalid > 0:
+    print(f"\nWARNING: {_n_invalid} hits ({_n_invalid/len(hits):.3%}) have offset outside the valid "
+          f"range [-1, +15] for {data_format} format (vmm-sdat README: valid offsets -1 to 15).")
+    print("  Breakdown by offset value (raw bits → signed):")
+    for off_val, cnt in hits.loc[~hits['hit_valid'], 'offset'].value_counts().sort_index().items():
+        raw = int(off_val) + 32
+        print(f"    offset={int(off_val):4d}  (raw={raw:2d} = {raw:05b}b):  {cnt} hits")
+    print("  These hits are flagged hit_valid=False. They are retained in the DataFrame")
+    print("  but you should exclude them with:  hits = hits[hits.hit_valid]")
+else:
+    print("Offset validity: all hits within valid range [-1, +15].")
+
 print(f"\nVMM IDs found: {sorted(hits.vmm.unique())}")
 for v in sorted(hits.vmm.unique()):
-    n = int((hits.vmm == v).sum())
-    print(f"  VMM {v:2d}: {n:,} hits")
+    n      = int((hits.vmm == v).sum())
+    n_bad  = int(((hits.vmm == v) & ~hits['hit_valid']).sum())
+    flag   = f"  *** {n_bad} anomalous ***" if n_bad else ""
+    print(f"  VMM {v:2d}: {n:,} hits{flag}")
 
 #########################################
 # HISTOGRAM PARAMETERS
@@ -678,14 +705,22 @@ for idx in range(n_vmm, nrows * ncols):
 fig_tdc.tight_layout()
 _save(fig_tdc, f"{base}_tdc.png")
 
-# --- Offset distribution ---
+# --- Offset distribution (valid hits in brown, anomalous in red) ---
 fig_offset, axes_offset = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows), squeeze=False)
-fig_offset.suptitle("Offset distribution per VMM (5-bit signed)", fontsize=14)
+fig_offset.suptitle("Offset distribution per VMM (5-bit signed)\n"
+                    "brown = valid [-1,+15]   red = anomalous (outside SRS spec)", fontsize=13)
 for idx, v in enumerate(vmm_ids):
-    ax   = axes_offset[idx // ncols][idx % ncols]
-    data = hits.loc[hits.vmm == v, 'offset']
-    ax.hist(data, bins=OFFSET_BINS, range=(OFFSET_MIN, OFFSET_MAX), color='saddlebrown', alpha=0.8)
-    ax.set_title(f"VMM {v}  ({len(data):,} hits)")
+    ax      = axes_offset[idx // ncols][idx % ncols]
+    vmm_sel = hits.vmm == v
+    valid   = hits.loc[vmm_sel &  hits['hit_valid'], 'offset']
+    bad     = hits.loc[vmm_sel & ~hits['hit_valid'], 'offset']
+    ax.hist(valid, bins=OFFSET_BINS, range=(OFFSET_MIN, OFFSET_MAX),
+            color='saddlebrown', alpha=0.8, label=f'valid ({len(valid):,})')
+    if len(bad):
+        ax.hist(bad, bins=OFFSET_BINS, range=(OFFSET_MIN, OFFSET_MAX),
+                color='red', alpha=0.9, label=f'anomalous ({len(bad):,})')
+        ax.legend(fontsize=7)
+    ax.set_title(f"VMM {v}  ({len(valid)+len(bad):,} hits)")
     ax.set_xlabel("Offset (signed)")
     ax.set_ylabel("Counts")
 for idx in range(n_vmm, nrows * ncols):
@@ -883,9 +918,10 @@ void _vmm_fill_hits(TTree* t,
                     const double*         abs_ts_a,
                     const double*         trg_time_a,
                     const unsigned short* trg_ctr_a,
+                    const unsigned char*  valid_a,
                     long long n)
 {
-    unsigned char  fec = 0, vmm = 0, ch = 0, ot = 0, tdc = 0;
+    unsigned char  fec = 0, vmm = 0, ch = 0, ot = 0, tdc = 0, valid = 0;
     unsigned short adc = 0, bcid = 0, trg_ctr = 0;
     unsigned int   ts = 0, udp_ts = 0, overflow = 0;
     signed char    off = 0;
@@ -907,6 +943,7 @@ void _vmm_fill_hits(TTree* t,
     t->Branch("abs_time_ns",     &abs_ts,   "abs_time_ns/D");
     t->Branch("trigger_time",    &trg_time, "trigger_time/D");
     t->Branch("trigger_counter", &trg_ctr,  "trigger_counter/s");
+    t->Branch("hit_valid",       &valid,    "hit_valid/b");
     for (long long i = 0; i < n; ++i) {
         fec      = fec_a[i];    vmm     = vmm_a[i];    ch       = ch_a[i];
         adc      = adc_a[i];    adc_cal = adc_cal_a[i]; ot      = ot_a[i];
@@ -915,6 +952,7 @@ void _vmm_fill_hits(TTree* t,
         bcid     = bcid_a[i];   tdc     = tdc_a[i];
         ts_ns    = ts_ns_a[i];  srs_ts  = srs_ts_a[i]; abs_ts   = abs_ts_a[i];
         trg_time = trg_time_a[i]; trg_ctr = trg_ctr_a[i];
+        valid    = valid_a[i];
         t->Fill();
     }
 }
@@ -1118,6 +1156,7 @@ if save_hits_tree:
         np.ascontiguousarray(hits['abs_time_ns'].values,     dtype=np.float64),
         np.ascontiguousarray(hits['trigger_time'].values.astype(np.float64)),
         np.ascontiguousarray(hits['trigger_counter'].values, dtype=np.uint16),
+        np.ascontiguousarray(hits['hit_valid'].values,       dtype=np.uint8),
         len(hits),
     )
     _hits_tree.Write()
