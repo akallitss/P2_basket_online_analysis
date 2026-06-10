@@ -866,37 +866,35 @@ def _fill1d(h, arr):
 # Cling-compiled C++ filler for the per-hit TTree — avoids a slow Python loop
 ROOT.gInterpreter.Declare("""
 void _vmm_fill_hits(TTree* t,
-                    const unsigned char*      fec_a,
-                    const unsigned char*      vmm_a,
-                    const unsigned char*      ch_a,
-                    const unsigned short*     adc_a,
-                    const float*              adc_cal_a,
-                    const unsigned char*      ot_a,
-                    const unsigned int*       time_a,
-                    const unsigned int*       udp_ts_a,
-                    const unsigned int*       overflow_a,
-                    const unsigned char*      off_a,
-                    const unsigned short*     bcid_a,
-                    const unsigned char*      tdc_a,
-                    const double*             ts_ns_a,
-                    const unsigned long long* srs_ts_a,
-                    const double*             abs_ts_a,
-                    const unsigned long long* trg_time_a,
-                    const unsigned short*     trg_ctr_a,
+                    const unsigned char*  fec_a,
+                    const unsigned char*  vmm_a,
+                    const unsigned char*  ch_a,
+                    const unsigned short* adc_a,
+                    const double*         adc_cal_a,
+                    const unsigned char*  ot_a,
+                    const unsigned int*   time_a,
+                    const unsigned int*   udp_ts_a,
+                    const unsigned int*   overflow_a,
+                    const unsigned char*  off_a,
+                    const unsigned short* bcid_a,
+                    const unsigned char*  tdc_a,
+                    const double*         ts_ns_a,
+                    const double*         srs_ts_a,
+                    const double*         abs_ts_a,
+                    const double*         trg_time_a,
+                    const unsigned short* trg_ctr_a,
                     long long n)
 {
-    unsigned char      fec = 0, vmm = 0, ch = 0, ot = 0, tdc = 0;
-    unsigned short     adc = 0, bcid = 0, trg_ctr = 0;
-    float              adc_cal = 0.0f;
-    unsigned int       ts = 0, udp_ts = 0, overflow = 0;
-    signed char        off = 0;
-    double             ts_ns = 0.0, abs_ts = 0.0;
-    unsigned long long srs_ts = 0, trg_time = 0;
+    unsigned char  fec = 0, vmm = 0, ch = 0, ot = 0, tdc = 0;
+    unsigned short adc = 0, bcid = 0, trg_ctr = 0;
+    unsigned int   ts = 0, udp_ts = 0, overflow = 0;
+    signed char    off = 0;
+    double         ts_ns = 0.0, adc_cal = 0.0, srs_ts = 0.0, abs_ts = 0.0, trg_time = 0.0;
     t->Branch("fec",             &fec,      "fec/b");
     t->Branch("vmm",             &vmm,      "vmm/b");
     t->Branch("ch",              &ch,       "ch/b");
     t->Branch("adc",             &adc,      "adc/s");
-    t->Branch("adc_calibrated",  &adc_cal,  "adc_calibrated/F");
+    t->Branch("adc_calibrated",  &adc_cal,  "adc_calibrated/D");
     t->Branch("over_threshold",  &ot,       "over_threshold/b");
     t->Branch("time",            &ts,       "time/i");
     t->Branch("udp_timestamp",   &udp_ts,   "udp_timestamp/i");
@@ -905,18 +903,18 @@ void _vmm_fill_hits(TTree* t,
     t->Branch("bcid",            &bcid,     "bcid/s");
     t->Branch("tdc",             &tdc,      "tdc/b");
     t->Branch("timestamp_ns",    &ts_ns,    "timestamp_ns/D");
-    t->Branch("srs_timestamp",   &srs_ts,   "srs_timestamp/l");
+    t->Branch("srs_timestamp",   &srs_ts,   "srs_timestamp/D");
     t->Branch("abs_time_ns",     &abs_ts,   "abs_time_ns/D");
-    t->Branch("trigger_time",    &trg_time, "trigger_time/l");
+    t->Branch("trigger_time",    &trg_time, "trigger_time/D");
     t->Branch("trigger_counter", &trg_ctr,  "trigger_counter/s");
     for (long long i = 0; i < n; ++i) {
-        fec      = fec_a[i];      vmm      = vmm_a[i];      ch       = ch_a[i];
-        adc      = adc_a[i];      adc_cal  = adc_cal_a[i];  ot       = ot_a[i];
-        ts       = time_a[i];     udp_ts   = udp_ts_a[i];   overflow = overflow_a[i];
+        fec      = fec_a[i];    vmm     = vmm_a[i];    ch       = ch_a[i];
+        adc      = adc_a[i];    adc_cal = adc_cal_a[i]; ot      = ot_a[i];
+        ts       = time_a[i];   udp_ts  = udp_ts_a[i]; overflow = overflow_a[i];
         off      = (signed char)off_a[i];
-        bcid     = bcid_a[i];     tdc      = tdc_a[i];
-        ts_ns    = ts_ns_a[i];    srs_ts   = srs_ts_a[i];   abs_ts   = abs_ts_a[i];
-        trg_time = trg_time_a[i]; trg_ctr  = trg_ctr_a[i];
+        bcid     = bcid_a[i];   tdc     = tdc_a[i];
+        ts_ns    = ts_ns_a[i];  srs_ts  = srs_ts_a[i]; abs_ts   = abs_ts_a[i];
+        trg_time = trg_time_a[i]; trg_ctr = trg_ctr_a[i];
         t->Fill();
     }
 }
@@ -1107,7 +1105,7 @@ if save_hits_tree:
         np.ascontiguousarray(hits['vmm'].values,             dtype=np.uint8),
         np.ascontiguousarray(hits['ch'].values,              dtype=np.uint8),
         np.ascontiguousarray(hits['adc'].values,             dtype=np.uint16),
-        np.ascontiguousarray(hits['adc_calibrated'].values,  dtype=np.float32),
+        np.ascontiguousarray(hits['adc_calibrated'].values,  dtype=np.float64),
         np.ascontiguousarray(hits['over_threshold'].values,  dtype=np.uint8),
         np.ascontiguousarray(hits['time'].values,            dtype=np.uint32),
         np.ascontiguousarray(hits['udp_timestamp'].values,   dtype=np.uint32),
@@ -1116,9 +1114,9 @@ if save_hits_tree:
         np.ascontiguousarray(hits['bcid'].values,            dtype=np.uint16),
         np.ascontiguousarray(hits['tdc'].values,             dtype=np.uint8),
         np.ascontiguousarray(hits['timestamp_ns'].values,    dtype=np.float64),
-        np.ascontiguousarray(hits['srs_timestamp'].values,   dtype=np.uint64),
+        np.ascontiguousarray(hits['srs_timestamp'].values.astype(np.float64)),
         np.ascontiguousarray(hits['abs_time_ns'].values,     dtype=np.float64),
-        np.ascontiguousarray(hits['trigger_time'].values,    dtype=np.uint64),
+        np.ascontiguousarray(hits['trigger_time'].values.astype(np.float64)),
         np.ascontiguousarray(hits['trigger_counter'].values, dtype=np.uint16),
         len(hits),
     )
