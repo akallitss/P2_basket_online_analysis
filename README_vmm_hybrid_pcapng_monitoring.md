@@ -140,15 +140,32 @@ analysis without re-parsing the pcapng:
 
 | branch | ROOT type | range | description |
 |---|---|---|---|
-| `fec` | `UChar_t` | 0–255 | FEC board ID (last octet of source IP) |
+| `fec` | `UChar_t` | 1–15 | FEC board ID (upper nibble of SRS header `dataId`, byte 7) |
 | `vmm` | `UChar_t` | 0–31 | VMM chip ID |
 | `ch` | `UChar_t` | 0–63 | channel number |
-| `adc` | `UShort_t` | 0–1023 | ADC value |
+| `adc` | `UShort_t` | 0–1023 | raw ADC value |
+| `adc_calibrated` | `Double_t` | — | calibrated ADC (`adc_slope × adc + adc_offset`); equals `adc` without `--calibration` |
 | `over_threshold` | `UChar_t` | 0/1 | over-threshold flag |
-| `time` | `UInt_t` | 0–2³²−1 | frame counter (proxy for time) |
-| `offset` | `Char_t` | −16–+15 | 5-bit signed timing offset |
-| `bcid` | `UShort_t` | 0–4095 | bunch-crossing ID |
+| `time` | `UInt_t` | 0–2³²−1 | frame counter (SRS header bytes 0–3) |
+| `offset` | `Char_t` | −16–+15 | 5-bit signed timing offset (BCID sweeps since last SRS marker) |
+| `bcid` | `UShort_t` | 0–4095 | bunch-crossing ID (Gray-decoded) |
 | `tdc` | `UChar_t` | 0–255 | TDC fine-timing value |
+| `timestamp_ns` | `Double_t` | — | chip_time relative to most recent SRS marker (ns) |
+| `srs_timestamp` | `Double_t` | — | 42-bit SRS marker FEC timestamp for this VMM (25 ns ticks; 0 before first marker) |
+| `abs_time_ns` | `Double_t` | — | absolute hit time = `srs_timestamp × 25 + timestamp_ns` (ns) |
+| `trigger_time` | `Double_t` | — | external trigger timestamp (TRG format only; 0 in SRS mode) |
+| `trigger_counter` | `UShort_t` | — | trigger event counter (TRG format only; 0 in SRS mode) |
+| `hit_valid` | `UChar_t` | 0/1 | 1 if offset is in the valid range [−1, +15] for the new SRS format; 0 otherwise |
+
+> **Deprecated SRS header fields — not present in output.**
+> The SRS header contains two additional 32-bit fields: `udpTimeStamp` (bytes 8–11,
+> intended as a per-packet FEC hardware timestamp) and `offsetOverflow` (bytes 12–15,
+> intended as a running BCID rollover counter). Both are explicitly marked as
+> *"will vanish soon and be replaced by a timestamp for each VMM"* in the vmm-sdat
+> `ParserSRS.cpp` source (ESS detector group). Current FEC firmware does not populate
+> either field: `udpTimeStamp` is always 0 and `offsetOverflow` is set once at
+> boot and never updated. They carry no timing information and are excluded from
+> the DataFrame and ROOT output.
 
 Example usage in a ROOT macro:
 

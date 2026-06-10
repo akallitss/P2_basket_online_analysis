@@ -13,8 +13,9 @@ hits DataFrame columns:
     fec            : FEC ID (from SRS dataId byte 7 upper nibble, 1-based)
     vmm            : VMM ID (0-31, from packet data)
     time           : frame counter (SRS header bytes 0-3)
-    udp_timestamp  : FEC hardware timestamp (SRS header bytes 8-11, 25 ns ticks / 40 MHz)
-    overflow       : BCID overflow count at last frame boundary (SRS header bytes 12-15)
+    # NOTE: udp_timestamp (bytes 8-11) and overflow (bytes 12-15) are deprecated SRS header fields —
+    # explicitly marked "will vanish soon" in vmm-sdat ParserSRS.cpp; not populated by current FEC
+    # firmware (always 0 and a fixed boot-time value respectively). Excluded from output.
     ch             : channel number (0-63)
     adc            : raw ADC value (0-1023)
     adc_calibrated : adc_slope * adc + adc_offset  (float; equals adc without --calibration)
@@ -165,13 +166,11 @@ _DEFAULT_MARKER = [0, 0, 0]  # [srs_ts, trigger_time, trigger_counter]
 
 def parse_block(block: bytes, frame_counter: int, fec_id: int,
                 markers: dict, data_format: str,
-                fec_buf, vmm_buf, time_buf, udp_ts_buf, overflow_buf,
+                fec_buf, vmm_buf, time_buf,
                 ch_buf, adc_buf, ot_buf, offset_buf, bcid_buf, tdc_buf,
                 srs_ts_buf, trg_time_buf, trg_ctr_buf):
     if len(block) < 22 or block[4:7] != b'VM3':
         return
-    udp_ts   = struct.unpack_from('>I', block,  8)[0]  # SRS header bytes  8-11
-    overflow = struct.unpack_from('>I', block, 12)[0]  # SRS header bytes 12-15
     for i in range(0, len(block) - 22, 6):
         d1, d2 = struct.unpack_from('>IH', block, i + 16)
         if d2 & 0x8000:          # hit word: MSB of d2 set
@@ -180,8 +179,6 @@ def parse_block(block: bytes, frame_counter: int, fec_id: int,
             fec_buf.append(fec_id)
             vmm_buf.append(vmm_id)
             time_buf.append(frame_counter)
-            udp_ts_buf.append(udp_ts)
-            overflow_buf.append(overflow)
             ch_buf.append((d2 >> 8) & 0x3F)     # bits 13-8 of d2
             adc_buf.append((d1 >> 12) & 0x3FF)  # bits 21-12 of d1
             ot_buf.append((d2 >> 14) & 0x1)     # bit 14 of d2
@@ -423,8 +420,6 @@ markers = {}
 fec_buf      = array.array('B')   # uint8
 vmm_buf      = array.array('B')   # uint8
 time_buf     = array.array('I')   # uint32 — frame counter (SRS header bytes 0-3)
-udp_ts_buf   = array.array('I')   # uint32 — FEC hardware timestamp (SRS header bytes 8-11, 25 ns ticks)
-overflow_buf = array.array('I')   # uint32 — BCID overflow count at last frame (SRS header bytes 12-15)
 ch_buf       = array.array('B')   # uint8
 adc_buf      = array.array('H')   # uint16
 ot_buf       = array.array('B')   # uint8 (0/1)
@@ -448,7 +443,7 @@ with PcapReader(pcap_file) as reader:
             n_before = len(fec_buf)
             parse_block(payload, fc, fec_id,
                         markers, data_format,
-                        fec_buf, vmm_buf, time_buf, udp_ts_buf, overflow_buf,
+                        fec_buf, vmm_buf, time_buf,
                         ch_buf, adc_buf, ot_buf, offset_buf, bcid_buf, tdc_buf,
                         srs_ts_buf, trg_time_buf, trg_ctr_buf)
             if len(fec_buf) > n_before:
@@ -500,8 +495,6 @@ hits = pd.DataFrame({
     'fec':             np.frombuffer(fec_buf,      dtype=np.uint8).copy(),
     'vmm':             _vmm,
     'time':            np.frombuffer(time_buf,     dtype=np.uint32).copy(),
-    'udp_timestamp':   np.frombuffer(udp_ts_buf,   dtype=np.uint32).copy(),
-    'overflow':        np.frombuffer(overflow_buf, dtype=np.uint32).copy(),
     'ch':              _ch,
     'adc':             _adc_raw,
     'adc_calibrated':  _adc_cal,
@@ -516,7 +509,7 @@ hits = pd.DataFrame({
     'trigger_counter': _trg_ctr,
     'hit_valid':       _hit_valid,
 })
-del (fec_buf, vmm_buf, time_buf, udp_ts_buf, overflow_buf, ch_buf, adc_buf, ot_buf,
+del (fec_buf, vmm_buf, time_buf, ch_buf, adc_buf, ot_buf,
      offset_buf, bcid_buf, tdc_buf, srs_ts_buf, trg_time_buf, trg_ctr_buf)
 
 mem_mb = hits.memory_usage(deep=True).sum() / 1e6
@@ -552,8 +545,6 @@ TIME_BINS     = 200
 BCID_BINS     = 100; BCID_MIN     = 0;   BCID_MAX     = 4096
 TDC_BINS      = 64;  TDC_MIN      = 0;   TDC_MAX      = 256
 OFFSET_BINS   = 32;  OFFSET_MIN   = -16; OFFSET_MAX   = 16
-UDP_TS_BINS   = 200  # range set dynamically from data
-OVERFLOW_BINS = 200  # range set dynamically from data
 
 #########################################
 # PLOTS
@@ -746,40 +737,6 @@ for idx in range(n_vmm, nrows * ncols):
 fig_ts.tight_layout()
 _save(fig_ts, f"{base}_timestamp_ns.png")
 
-# --- UDP timestamp distribution ---
-udp_ts_min = int(hits['udp_timestamp'].min())
-udp_ts_max = int(hits['udp_timestamp'].max())
-fig_udpts, axes_udpts = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows), squeeze=False)
-fig_udpts.suptitle("UDP timestamp per VMM (40 MHz FEC clock, 25 ns ticks)", fontsize=14)
-for idx, v in enumerate(vmm_ids):
-    ax   = axes_udpts[idx // ncols][idx % ncols]
-    data = hits.loc[hits.vmm == v, 'udp_timestamp']
-    ax.hist(data, bins=UDP_TS_BINS, range=(udp_ts_min, udp_ts_max), color='slateblue', alpha=0.8)
-    ax.set_title(f"VMM {v}  ({len(data):,} hits)")
-    ax.set_xlabel("UDP timestamp (25 ns ticks)")
-    ax.set_ylabel("Counts")
-for idx in range(n_vmm, nrows * ncols):
-    axes_udpts[idx // ncols][idx % ncols].set_visible(False)
-fig_udpts.tight_layout()
-_save(fig_udpts, f"{base}_udp_timestamp.png")
-
-# --- Overflow (BCID overflow count at last frame boundary) distribution ---
-overflow_min = int(hits['overflow'].min())
-overflow_max = int(hits['overflow'].max())
-fig_ovf, axes_ovf = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows), squeeze=False)
-fig_ovf.suptitle("BCID overflow count at last frame boundary per VMM", fontsize=14)
-for idx, v in enumerate(vmm_ids):
-    ax   = axes_ovf[idx // ncols][idx % ncols]
-    data = hits.loc[hits.vmm == v, 'overflow']
-    ax.hist(data, bins=OVERFLOW_BINS, range=(overflow_min, overflow_max), color='sienna', alpha=0.8)
-    ax.set_title(f"VMM {v}  ({len(data):,} hits)")
-    ax.set_xlabel("Overflow count")
-    ax.set_ylabel("Counts")
-for idx in range(n_vmm, nrows * ncols):
-    axes_ovf[idx // ncols][idx % ncols].set_visible(False)
-fig_ovf.tight_layout()
-_save(fig_ovf, f"{base}_overflow.png")
-
 # --- Absolute time distribution ---
 abs_min_ns = float(hits['abs_time_ns'].min())
 abs_max_ns = float(hits['abs_time_ns'].max())
@@ -908,8 +865,6 @@ void _vmm_fill_hits(TTree* t,
                     const double*         adc_cal_a,
                     const unsigned char*  ot_a,
                     const unsigned int*   time_a,
-                    const unsigned int*   udp_ts_a,
-                    const unsigned int*   overflow_a,
                     const unsigned char*  off_a,
                     const unsigned short* bcid_a,
                     const unsigned char*  tdc_a,
@@ -923,7 +878,7 @@ void _vmm_fill_hits(TTree* t,
 {
     unsigned char  fec = 0, vmm = 0, ch = 0, ot = 0, tdc = 0, valid = 0;
     unsigned short adc = 0, bcid = 0, trg_ctr = 0;
-    unsigned int   ts = 0, udp_ts = 0, overflow = 0;
+    unsigned int   ts = 0;
     signed char    off = 0;
     double         ts_ns = 0.0, adc_cal = 0.0, srs_ts = 0.0, abs_ts = 0.0, trg_time = 0.0;
     t->Branch("fec",             &fec,      "fec/b");
@@ -933,8 +888,6 @@ void _vmm_fill_hits(TTree* t,
     t->Branch("adc_calibrated",  &adc_cal,  "adc_calibrated/D");
     t->Branch("over_threshold",  &ot,       "over_threshold/b");
     t->Branch("time",            &ts,       "time/i");
-    t->Branch("udp_timestamp",   &udp_ts,   "udp_timestamp/i");
-    t->Branch("overflow",        &overflow, "overflow/i");
     t->Branch("offset",          &off,      "offset/B");
     t->Branch("bcid",            &bcid,     "bcid/s");
     t->Branch("tdc",             &tdc,      "tdc/b");
@@ -947,7 +900,7 @@ void _vmm_fill_hits(TTree* t,
     for (long long i = 0; i < n; ++i) {
         fec      = fec_a[i];    vmm     = vmm_a[i];    ch       = ch_a[i];
         adc      = adc_a[i];    adc_cal = adc_cal_a[i]; ot      = ot_a[i];
-        ts       = time_a[i];   udp_ts  = udp_ts_a[i]; overflow = overflow_a[i];
+        ts       = time_a[i];
         off      = (signed char)off_a[i];
         bcid     = bcid_a[i];   tdc     = tdc_a[i];
         ts_ns    = ts_ns_a[i];  srs_ts  = srs_ts_a[i]; abs_ts   = abs_ts_a[i];
@@ -1091,18 +1044,6 @@ for v in vmm_ids:
     _fill1d(h_ts, vdata['timestamp_ns'].values.astype(np.float64))
     h_ts.Write()
 
-    h_udpts = ROOT.TH1D("udp_timestamp",
-                         f"UDP timestamp — VMM {v};UDP timestamp (25 ns ticks);Counts",
-                         UDP_TS_BINS, udp_ts_min, udp_ts_max)
-    _fill1d(h_udpts, vdata['udp_timestamp'].values.astype(np.float64))
-    h_udpts.Write()
-
-    h_ovf = ROOT.TH1D("overflow",
-                       f"BCID overflow count — VMM {v};Overflow count;Counts",
-                       OVERFLOW_BINS, overflow_min, overflow_max)
-    _fill1d(h_ovf, vdata['overflow'].values.astype(np.float64))
-    h_ovf.Write()
-
     h_abs = ROOT.TH1D("abs_time_ns", f"Absolute time — VMM {v};Absolute time (ns);Counts",
                       TS_BINS, abs_min_ns, abs_max_ns)
     _fill1d(h_abs, vdata['abs_time_ns'].values.astype(np.float64))
@@ -1146,8 +1087,6 @@ if save_hits_tree:
         np.ascontiguousarray(hits['adc_calibrated'].values,  dtype=np.float64),
         np.ascontiguousarray(hits['over_threshold'].values,  dtype=np.uint8),
         np.ascontiguousarray(hits['time'].values,            dtype=np.uint32),
-        np.ascontiguousarray(hits['udp_timestamp'].values,   dtype=np.uint32),
-        np.ascontiguousarray(hits['overflow'].values,        dtype=np.uint32),
         np.ascontiguousarray(hits['offset'].values.view(np.uint8)),
         np.ascontiguousarray(hits['bcid'].values,            dtype=np.uint16),
         np.ascontiguousarray(hits['tdc'].values,             dtype=np.uint8),
