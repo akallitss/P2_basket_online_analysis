@@ -10,18 +10,24 @@ Usage:
 Output PNGs are saved in the same directory as the input file.
 
 hits DataFrame columns:
-    fec            : FEC ID (last octet of source IP)
+    fec            : FEC ID (from SRS dataId byte 7 upper nibble, 1-based)
     vmm            : VMM ID (0-31, from packet data)
     time           : frame counter (SRS header bytes 0-3)
     udp_timestamp  : FEC hardware timestamp (SRS header bytes 8-11, 25 ns ticks / 40 MHz)
     overflow       : BCID overflow count at last frame boundary (SRS header bytes 12-15)
     ch             : channel number (0-63)
-    adc            : ADC value (0-1023)
+    adc            : raw ADC value (0-1023)
+    adc_calibrated : adc_slope * adc + adc_offset  (float; equals adc without --calibration)
     over_threshold : over-threshold flag (bool)
     offset         : 5-bit signed offset, #BCID overflows since last SRS marker (-16 to +15)
     bcid           : bunch-crossing ID (0-4095, 12-bit, Gray-decoded)
     tdc            : TDC fine-timing value (0-255, 8-bit)
-    timestamp_ns   : chip_time in ns = (offset*4096 + bcid + 1.5)*22.5 - tdc*60/256
+    timestamp_ns   : chip_time = (offset*4096 + bcid)*22.5 + (22.5 - tdc*60/255 - time_offset)*time_slope
+                     (relative to most recent SRS marker; time_offset/slope default to 0/1 without --calibration)
+    srs_timestamp  : 42-bit SRS marker FEC timestamp for this VMM (25 ns ticks; 0 before first marker)
+    abs_time_ns    : absolute time = srs_timestamp * 25 + timestamp_ns (ns)
+    trigger_time   : 42-bit external trigger timestamp (TRG format only; 25 ns ticks; 0 in SRS mode)
+    trigger_counter: trigger event counter (TRG format only; 0 in SRS mode)
 """
 
 import sys
@@ -72,6 +78,7 @@ PROBE_PACKETS = 500
 SRC_IP_OVERRIDE = None  # e.g. "192.168.1.13" to force a specific IP
 CLOCK_PERIOD_NS = 22.5  # ns per BCID count (44.44 MHz clock)
 TAC_SLOPE_NS    = 60.0  # ns full-scale of the TDC TAC ramp (default; tunable per VMM)
+TDC_RANGE       = 255   # TDC full-scale bin count (matches vmm-sdat SRSTime::tdc_range)
 
 
 def gray2bin_np(arr):
@@ -83,6 +90,55 @@ def gray2bin_np(arr):
     arr ^= arr >> 2
     arr ^= arr >> 1
     return arr.astype(np.uint16)
+
+
+def load_calibration(json_path):
+    """Parse a vmm-sdat calibration JSON and return per-(vmm,ch) correction arrays.
+
+    Supports the real vmm-sdat file format (vmmID + hybridID, arrays of 64 floats).
+    Also accepts the C++ ParserSRS format (fecID + vmmID) — fecID is ignored; calibration
+    is applied by vmmID only, which is correct for single-FEC setups.
+
+    Returns four numpy arrays shaped (32, 64):
+        time_offset  — subtracted from the TAC term before applying time_slope (ns)
+        time_slope   — multiplies (bc_factor - tdc_corr - time_offset)
+        adc_offset   — applied as:  adc_calibrated = adc_slope * adc + adc_offset
+        adc_slope    — (see above)
+
+    Timewalk coefficients (timewalk_a/b/c/d) are loaded and printed but not yet applied
+    since the application formula is not part of the base ParserSRS.
+    """
+    import json as _json
+    with open(json_path) as _f:
+        data = _json.load(_f)
+
+    time_offset = np.zeros((32, 64), dtype=np.float64)
+    time_slope  = np.ones( (32, 64), dtype=np.float64)
+    adc_offset  = np.zeros((32, 64), dtype=np.float64)
+    adc_slope   = np.ones( (32, 64), dtype=np.float64)
+
+    has_time, has_adc, has_tw = False, False, False
+    for entry in data.get('vmm_calibration', []):
+        vid = int(entry['vmmID'])
+        if vid >= 32:
+            continue
+        def _load(key, arr, row):
+            vals = entry.get(key, [])
+            if vals:
+                arr[row, :min(len(vals), 64)] = vals[:64]
+        _load('time_offsets', time_offset, vid); has_time = has_time or bool(entry.get('time_offsets'))
+        _load('time_slopes',  time_slope,  vid)
+        _load('adc_offsets',  adc_offset,  vid); has_adc = has_adc or bool(entry.get('adc_offsets'))
+        _load('adc_slopes',   adc_slope,   vid)
+        if any(entry.get(k) for k in ('timewalk_a','timewalk_b','timewalk_c','timewalk_d')):
+            has_tw = True
+
+    loaded = []
+    if has_time: loaded.append('time_offset/slope')
+    if has_adc:  loaded.append('adc_offset/slope')
+    if has_tw:   loaded.append('timewalk (loaded, not applied)')
+    print(f"  Calibration arrays loaded: {', '.join(loaded) if loaded else 'none found'}")
+    return time_offset, time_slope, adc_offset, adc_slope
 
 
 def detect_fec_ips(filename, n_probe=PROBE_PACKETS):
@@ -102,18 +158,24 @@ def detect_fec_ips(filename, n_probe=PROBE_PACKETS):
 #########################################
 # PARSE ONE UDP PAYLOAD BLOCK
 #########################################
+_DEFAULT_MARKER = [0, 0, 0]  # [srs_ts, trigger_time, trigger_counter]
+
 def parse_block(block: bytes, frame_counter: int, fec_id: int,
+                markers: dict, data_format: str,
                 fec_buf, vmm_buf, time_buf, udp_ts_buf, overflow_buf,
-                ch_buf, adc_buf, ot_buf, offset_buf, bcid_buf, tdc_buf):
+                ch_buf, adc_buf, ot_buf, offset_buf, bcid_buf, tdc_buf,
+                srs_ts_buf, trg_time_buf, trg_ctr_buf):
     if len(block) < 22 or block[4:7] != b'VM3':
         return
     udp_ts   = struct.unpack_from('>I', block,  8)[0]  # SRS header bytes  8-11
     overflow = struct.unpack_from('>I', block, 12)[0]  # SRS header bytes 12-15
     for i in range(0, len(block) - 22, 6):
         d1, d2 = struct.unpack_from('>IH', block, i + 16)
-        if d2 & 0x8000:          # valid-hit flag = MSB of d2
+        if d2 & 0x8000:          # hit word: MSB of d2 set
+            vmm_id  = (d1 >> 22) & 0x1F
+            m       = markers.get((fec_id, vmm_id), _DEFAULT_MARKER)
             fec_buf.append(fec_id)
-            vmm_buf.append((d1 >> 22) & 0x1F)   # bits 26-22 of d1
+            vmm_buf.append(vmm_id)
             time_buf.append(frame_counter)
             udp_ts_buf.append(udp_ts)
             overflow_buf.append(overflow)
@@ -124,6 +186,38 @@ def parse_block(block: bytes, frame_counter: int, fec_id: int,
             offset_buf.append(raw_off if raw_off < 16 else raw_off - 32)
             bcid_buf.append(d1 & 0xFFF)          # bits 11-0 of d1 — raw Gray code; decoded below
             tdc_buf.append(d2 & 0xFF)            # bits 7-0 of d2
+            srs_ts_buf.append(m[0])
+            trg_time_buf.append(m[1])
+            trg_ctr_buf.append(m[2])
+        else:                    # marker word: MSB of d2 clear
+            vmmid_marker = (d2 >> 10) & 0x1F
+            if vmmid_marker < 16:
+                # Normal VMM marker — 42-bit SRS FEC timestamp (25 ns ticks)
+                srs_ts = (d1 << 10) | (d2 & 0x3FF)
+                key = (fec_id, vmmid_marker)
+                if data_format == 'SRS':
+                    if key not in markers:
+                        markers[key] = [0, 0, 0]
+                    markers[key][0] = srs_ts
+                else:
+                    # TRG mode: VMM markers carry a relative BCID timestamp (< 4096)
+                    if srs_ts < 4096:
+                        if key not in markers:
+                            markers[key] = [0, 0, 0]
+                        markers[key][0] = srs_ts
+            elif data_format == 'TRG':
+                # TRG marker (vmmid >= 16): carries external trigger info
+                # Maps to the same VMM slot as vmmid % 16
+                key = (fec_id, vmmid_marker % 16)
+                if key not in markers:
+                    markers[key] = [0, 0, 0]
+                trigger_flag = (d1 >> 28) & 0x0F
+                if trigger_flag == 0xF:
+                    # Trigger counter word (16-bit: 6 high bits from d1, 10 low from d2)
+                    markers[key][2] = (d1 & 0x3F) * 1024 + (d2 & 0x3FF)
+                else:
+                    # Trigger timestamp: upper 32 bits only (lower 10 unused — matches C++)
+                    markers[key][1] = d1 << 10
 
 #########################################
 # LIVE-MONITORING HELPERS
@@ -266,6 +360,12 @@ _ap = argparse.ArgumentParser(
 _ap.add_argument("pcap_file", help="Input .pcapng file")
 _ap.add_argument("--no-hits-tree", action="store_true",
                  help="Skip writing the per-hit 'hits' TTree (saves time and disk for large files)")
+_ap.add_argument("--calibration", metavar="JSON",
+                 help="vmm-sdat calibration JSON file with per-channel time and ADC corrections "
+                      "(time_offsets, time_slopes, adc_offsets, adc_slopes arrays of 64 floats per VMM)")
+_ap.add_argument("--format", choices=["SRS", "TRG"], default="SRS",
+                 help="SRS data format: SRS (continuous readout, default) or "
+                      "TRG (external trigger — parses trigger_counter and trigger_time from marker words)")
 _ap.add_argument("--live", action="store_true",
                  help="Live monitoring mode: follow a growing pcapng and display "
                       "hit-rate-per-channel for each active VMM (no ROOT output)")
@@ -275,6 +375,18 @@ _args = _ap.parse_args()
 
 pcap_file      = _args.pcap_file
 save_hits_tree = not _args.no_hits_tree
+data_format    = _args.format
+
+if _args.calibration:
+    print(f"Loading calibration: {_args.calibration}")
+    _cal_to, _cal_ts, _cal_ao, _cal_as = load_calibration(_args.calibration)
+    _has_calibration = True
+else:
+    _cal_to = np.zeros((32, 64), dtype=np.float64)
+    _cal_ts = np.ones( (32, 64), dtype=np.float64)
+    _cal_ao = np.zeros((32, 64), dtype=np.float64)
+    _cal_as = np.ones( (32, 64), dtype=np.float64)
+    _has_calibration = False
 
 if not os.path.isfile(pcap_file):
     print(f"File not found: {pcap_file}")
@@ -301,6 +413,9 @@ if _args.live:
     ROOT.gROOT.SetBatch(True)
 # --------------------------------------------------------------------------
 
+# Per-VMM marker state: (fec_id, vmm_id) → [srs_ts, trigger_time, trigger_counter]
+markers = {}
+
 # Memory-efficient typed arrays (no Python object overhead)
 fec_buf      = array.array('B')   # uint8
 vmm_buf      = array.array('B')   # uint8
@@ -313,6 +428,9 @@ ot_buf       = array.array('B')   # uint8 (0/1)
 offset_buf   = array.array('b')   # int8  (-16 to +15, 5-bit signed)
 bcid_buf     = array.array('H')   # uint16 (0-4095)
 tdc_buf      = array.array('B')   # uint8  (0-255)
+srs_ts_buf   = array.array('Q')   # uint64 — 42-bit SRS marker FEC timestamp (25 ns ticks)
+trg_time_buf = array.array('Q')   # uint64 — 42-bit external trigger timestamp (TRG mode)
+trg_ctr_buf  = array.array('H')   # uint16 — trigger counter (TRG mode)
 
 print(f"Reading: {pcap_file}")
 pkt_count = 0
@@ -323,11 +441,13 @@ with PcapReader(pcap_file) as reader:
         if UDP in pkt and IP in pkt and pkt[IP].src in src_ips:
             payload = bytes(pkt[UDP].payload)
             fc     = struct.unpack_from('>I', payload)[0]
-            fec_id = int(pkt[IP].src.split('.')[-1])
+            fec_id = (struct.unpack_from('>I', payload, 4)[0] >> 4) & 0x0F
             n_before = len(fec_buf)
             parse_block(payload, fc, fec_id,
+                        markers, data_format,
                         fec_buf, vmm_buf, time_buf, udp_ts_buf, overflow_buf,
-                        ch_buf, adc_buf, ot_buf, offset_buf, bcid_buf, tdc_buf)
+                        ch_buf, adc_buf, ot_buf, offset_buf, bcid_buf, tdc_buf,
+                        srs_ts_buf, trg_time_buf, trg_ctr_buf)
             if len(fec_buf) > n_before:
                 vm3_count += 1
         pkt_count += 1
@@ -340,29 +460,54 @@ print(f"\nDone: {pkt_count} packets | {vm3_count} VM3 packets | {len(fec_buf):,}
 _bcid_raw = np.frombuffer(bcid_buf,    dtype=np.uint16).copy()
 _offset   = np.frombuffer(offset_buf,  dtype=np.int8).copy()
 _tdc      = np.frombuffer(tdc_buf,     dtype=np.uint8).copy()
-_bcid     = gray2bin_np(_bcid_raw)     # Gray → binary, matching Lua gray2bin32
-# Full chip_time formula (ESS vmm-sdat docs):
-#   chip_time = (BCID + 1.5) × 22.5 ns  −  TDC × TAC_slope / 256
-#   t_hit     = offset × 4096 × 22.5 ns + chip_time
-_timestamp_ns = (
-    (_offset.astype(np.float64) * 4096 + _bcid.astype(np.float64) + 1.5) * CLOCK_PERIOD_NS
-    - _tdc.astype(np.float64) * TAC_SLOPE_NS / 256.0
-)
+_adc_raw  = np.frombuffer(adc_buf,     dtype=np.uint16).copy()
+_vmm      = np.frombuffer(vmm_buf,     dtype=np.uint8).copy()
+_ch       = np.frombuffer(ch_buf,      dtype=np.uint8).copy()
+_bcid     = gray2bin_np(_bcid_raw)     # Gray → binary, matching vmm-sdat gray2bin32
+
+# Per-hit calibration lookup (vectorised over vmm/ch index pairs)
+_t_off = _cal_to[_vmm.astype(np.intp), _ch.astype(np.intp)]
+_t_slp = _cal_ts[_vmm.astype(np.intp), _ch.astype(np.intp)]
+_a_off = _cal_ao[_vmm.astype(np.intp), _ch.astype(np.intp)]
+_a_slp = _cal_as[_vmm.astype(np.intp), _ch.astype(np.intp)]
+
+# chip_time formula matching vmm-sdat SRSTime::chip_time_ns (calibrated):
+#   t_coarse = (offset*4096 + bcid) * bc_factor
+#   t_fine   = (bc_factor - tdc * (tac/255) - time_offset) * time_slope
+#   timestamp_ns = t_coarse + t_fine
+# Without calibration (time_offset=0, time_slope=1):
+#   = (offset*4096 + bcid + 1) * 22.5 - tdc * 60/255
+_t_coarse = (_offset.astype(np.float64) * 4096 + _bcid.astype(np.float64)) * CLOCK_PERIOD_NS
+_t_fine   = (CLOCK_PERIOD_NS - _tdc.astype(np.float64) * TAC_SLOPE_NS / TDC_RANGE - _t_off) * _t_slp
+_timestamp_ns = _t_coarse + _t_fine
+
+_srs_ts   = np.frombuffer(srs_ts_buf,   dtype=np.uint64).copy()
+_trg_time = np.frombuffer(trg_time_buf, dtype=np.uint64).copy()
+_trg_ctr  = np.frombuffer(trg_ctr_buf,  dtype=np.uint16).copy()
+_abs_time_ns = _srs_ts.astype(np.float64) * 25.0 + _timestamp_ns
+_adc_cal  = (_a_slp * _adc_raw.astype(np.float64) + _a_off).astype(np.float32)
+
 hits = pd.DataFrame({
-    'fec':            np.frombuffer(fec_buf,      dtype=np.uint8).copy(),
-    'vmm':            np.frombuffer(vmm_buf,      dtype=np.uint8).copy(),
-    'time':           np.frombuffer(time_buf,     dtype=np.uint32).copy(),
-    'udp_timestamp':  np.frombuffer(udp_ts_buf,   dtype=np.uint32).copy(),
-    'overflow':       np.frombuffer(overflow_buf, dtype=np.uint32).copy(),
-    'ch':             np.frombuffer(ch_buf,       dtype=np.uint8).copy(),
-    'adc':            np.frombuffer(adc_buf,      dtype=np.uint16).copy(),
-    'over_threshold': np.frombuffer(ot_buf,       dtype=np.uint8).astype(bool).copy(),
-    'offset':         _offset,
-    'bcid':           _bcid,
-    'tdc':            _tdc,
-    'timestamp_ns':   _timestamp_ns,
+    'fec':             np.frombuffer(fec_buf,      dtype=np.uint8).copy(),
+    'vmm':             _vmm,
+    'time':            np.frombuffer(time_buf,     dtype=np.uint32).copy(),
+    'udp_timestamp':   np.frombuffer(udp_ts_buf,   dtype=np.uint32).copy(),
+    'overflow':        np.frombuffer(overflow_buf, dtype=np.uint32).copy(),
+    'ch':              _ch,
+    'adc':             _adc_raw,
+    'adc_calibrated':  _adc_cal,
+    'over_threshold':  np.frombuffer(ot_buf,       dtype=np.uint8).astype(bool).copy(),
+    'offset':          _offset,
+    'bcid':            _bcid,
+    'tdc':             _tdc,
+    'timestamp_ns':    _timestamp_ns,
+    'srs_timestamp':   _srs_ts,
+    'abs_time_ns':     _abs_time_ns,
+    'trigger_time':    _trg_time,
+    'trigger_counter': _trg_ctr,
 })
-del fec_buf, vmm_buf, time_buf, udp_ts_buf, overflow_buf, ch_buf, adc_buf, ot_buf, offset_buf, bcid_buf, tdc_buf
+del (fec_buf, vmm_buf, time_buf, udp_ts_buf, overflow_buf, ch_buf, adc_buf, ot_buf,
+     offset_buf, bcid_buf, tdc_buf, srs_ts_buf, trg_time_buf, trg_ctr_buf)
 
 mem_mb = hits.memory_usage(deep=True).sum() / 1e6
 print(f"DataFrame memory: {mem_mb:.1f} MB")
@@ -600,6 +745,97 @@ for idx in range(n_vmm, nrows * ncols):
 fig_ovf.tight_layout()
 _save(fig_ovf, f"{base}_overflow.png")
 
+# --- Absolute time distribution ---
+abs_min_ns = float(hits['abs_time_ns'].min())
+abs_max_ns = float(hits['abs_time_ns'].max())
+fig_abs, axes_abs = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows), squeeze=False)
+fig_abs.suptitle("Absolute hit time per VMM (SRS marker + chip_time, ns)", fontsize=14)
+for idx, v in enumerate(vmm_ids):
+    ax   = axes_abs[idx // ncols][idx % ncols]
+    data = hits.loc[hits.vmm == v, 'abs_time_ns']
+    ax.hist(data, bins=TS_BINS, range=(abs_min_ns, abs_max_ns), color='mediumseagreen', alpha=0.8)
+    ax.set_title(f"VMM {v}  ({len(data):,} hits)")
+    ax.set_xlabel("Absolute time (ns)")
+    ax.set_ylabel("Counts")
+for idx in range(n_vmm, nrows * ncols):
+    axes_abs[idx // ncols][idx % ncols].set_visible(False)
+fig_abs.tight_layout()
+_save(fig_abs, f"{base}_abs_time_ns.png")
+
+# --- SRS marker timestamp distribution ---
+srs_min = int(hits['srs_timestamp'].min())
+srs_max = int(hits['srs_timestamp'].max())
+if srs_max > srs_min:
+    fig_srs, axes_srs = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows), squeeze=False)
+    fig_srs.suptitle("SRS marker timestamp per VMM (42-bit, 25 ns ticks)", fontsize=14)
+    for idx, v in enumerate(vmm_ids):
+        ax   = axes_srs[idx // ncols][idx % ncols]
+        data = hits.loc[hits.vmm == v, 'srs_timestamp']
+        ax.hist(data.astype(np.float64), bins=200, range=(srs_min, srs_max),
+                color='cadetblue', alpha=0.8)
+        ax.set_title(f"VMM {v}  ({len(data):,} hits)")
+        ax.set_xlabel("SRS timestamp (25 ns ticks)")
+        ax.set_ylabel("Counts")
+    for idx in range(n_vmm, nrows * ncols):
+        axes_srs[idx // ncols][idx % ncols].set_visible(False)
+    fig_srs.tight_layout()
+    _save(fig_srs, f"{base}_srs_timestamp.png")
+
+# --- Calibrated ADC distribution (only if a calibration file was given) ---
+if _has_calibration:
+    adc_cal_min = float(hits['adc_calibrated'].min())
+    adc_cal_max = float(hits['adc_calibrated'].max())
+    fig_adccal, axes_adccal = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows), squeeze=False)
+    fig_adccal.suptitle("Calibrated ADC per VMM", fontsize=14)
+    for idx, v in enumerate(vmm_ids):
+        ax   = axes_adccal[idx // ncols][idx % ncols]
+        data = hits.loc[hits.vmm == v, 'adc_calibrated']
+        ax.hist(data, bins=ADC_BINS, range=(adc_cal_min, adc_cal_max), color='darkorange', alpha=0.8)
+        ax.set_title(f"VMM {v}  ({len(data):,} hits)")
+        ax.set_xlabel("Calibrated ADC")
+        ax.set_ylabel("Counts")
+    for idx in range(n_vmm, nrows * ncols):
+        axes_adccal[idx // ncols][idx % ncols].set_visible(False)
+    fig_adccal.tight_layout()
+    _save(fig_adccal, f"{base}_adc_calibrated.png")
+
+# --- TRG trigger counter and trigger time (TRG format only) ---
+if data_format == 'TRG' and hits['trigger_counter'].max() > 0:
+    fig_tc, axes_tc = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows), squeeze=False)
+    fig_tc.suptitle("Trigger counter per VMM (TRG mode)", fontsize=14)
+    tc_min = int(hits['trigger_counter'].min())
+    tc_max = int(hits['trigger_counter'].max())
+    for idx, v in enumerate(vmm_ids):
+        ax   = axes_tc[idx // ncols][idx % ncols]
+        data = hits.loc[hits.vmm == v, 'trigger_counter']
+        ax.hist(data, bins=min(200, tc_max - tc_min + 1), range=(tc_min, tc_max + 1),
+                color='firebrick', alpha=0.8)
+        ax.set_title(f"VMM {v}  ({len(data):,} hits)")
+        ax.set_xlabel("Trigger counter")
+        ax.set_ylabel("Counts")
+    for idx in range(n_vmm, nrows * ncols):
+        axes_tc[idx // ncols][idx % ncols].set_visible(False)
+    fig_tc.tight_layout()
+    _save(fig_tc, f"{base}_trigger_counter.png")
+
+    tt_min = int(hits['trigger_time'].min())
+    tt_max = int(hits['trigger_time'].max())
+    if tt_max > tt_min:
+        fig_tt, axes_tt = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows), squeeze=False)
+        fig_tt.suptitle("Trigger time per VMM (TRG mode, 25 ns ticks)", fontsize=14)
+        for idx, v in enumerate(vmm_ids):
+            ax   = axes_tt[idx // ncols][idx % ncols]
+            data = hits.loc[hits.vmm == v, 'trigger_time']
+            ax.hist(data.astype(np.float64), bins=200, range=(tt_min, tt_max),
+                    color='tomato', alpha=0.8)
+            ax.set_title(f"VMM {v}  ({len(data):,} hits)")
+            ax.set_xlabel("Trigger time (25 ns ticks)")
+            ax.set_ylabel("Counts")
+        for idx in range(n_vmm, nrows * ncols):
+            axes_tt[idx // ncols][idx % ncols].set_visible(False)
+        fig_tt.tight_layout()
+        _save(fig_tt, f"{base}_trigger_time.png")
+
 # --- Time distribution: one PNG per VMM (built and saved immediately to avoid accumulation) ---
 t_min, t_max = int(hits.time.min()), int(hits.time.max())
 for v in vmm_ids:
@@ -630,43 +866,57 @@ def _fill1d(h, arr):
 # Cling-compiled C++ filler for the per-hit TTree — avoids a slow Python loop
 ROOT.gInterpreter.Declare("""
 void _vmm_fill_hits(TTree* t,
-                    const unsigned char*  fec_a,
-                    const unsigned char*  vmm_a,
-                    const unsigned char*  ch_a,
-                    const unsigned short* adc_a,
-                    const unsigned char*  ot_a,
-                    const unsigned int*   time_a,
-                    const unsigned int*   udp_ts_a,
-                    const unsigned int*   overflow_a,
-                    const unsigned char*  off_a,
-                    const unsigned short* bcid_a,
-                    const unsigned char*  tdc_a,
-                    const double*         ts_ns_a,
+                    const unsigned char*      fec_a,
+                    const unsigned char*      vmm_a,
+                    const unsigned char*      ch_a,
+                    const unsigned short*     adc_a,
+                    const float*              adc_cal_a,
+                    const unsigned char*      ot_a,
+                    const unsigned int*       time_a,
+                    const unsigned int*       udp_ts_a,
+                    const unsigned int*       overflow_a,
+                    const unsigned char*      off_a,
+                    const unsigned short*     bcid_a,
+                    const unsigned char*      tdc_a,
+                    const double*             ts_ns_a,
+                    const unsigned long long* srs_ts_a,
+                    const double*             abs_ts_a,
+                    const unsigned long long* trg_time_a,
+                    const unsigned short*     trg_ctr_a,
                     long long n)
 {
-    unsigned char  fec = 0, vmm = 0, ch = 0, ot = 0, tdc = 0;
-    unsigned short adc = 0, bcid = 0;
-    unsigned int   ts = 0, udp_ts = 0, overflow = 0;
-    signed char    off = 0;
-    double         ts_ns = 0.0;
-    t->Branch("fec",            &fec,      "fec/b");
-    t->Branch("vmm",            &vmm,      "vmm/b");
-    t->Branch("ch",             &ch,       "ch/b");
-    t->Branch("adc",            &adc,      "adc/s");
-    t->Branch("over_threshold", &ot,       "over_threshold/b");
-    t->Branch("time",           &ts,       "time/i");
-    t->Branch("udp_timestamp",  &udp_ts,   "udp_timestamp/i");
-    t->Branch("overflow",       &overflow, "overflow/i");
-    t->Branch("offset",         &off,      "offset/B");
-    t->Branch("bcid",           &bcid,     "bcid/s");
-    t->Branch("tdc",            &tdc,      "tdc/b");
-    t->Branch("timestamp_ns",   &ts_ns,    "timestamp_ns/D");
+    unsigned char      fec = 0, vmm = 0, ch = 0, ot = 0, tdc = 0;
+    unsigned short     adc = 0, bcid = 0, trg_ctr = 0;
+    float              adc_cal = 0.0f;
+    unsigned int       ts = 0, udp_ts = 0, overflow = 0;
+    signed char        off = 0;
+    double             ts_ns = 0.0, abs_ts = 0.0;
+    unsigned long long srs_ts = 0, trg_time = 0;
+    t->Branch("fec",             &fec,      "fec/b");
+    t->Branch("vmm",             &vmm,      "vmm/b");
+    t->Branch("ch",              &ch,       "ch/b");
+    t->Branch("adc",             &adc,      "adc/s");
+    t->Branch("adc_calibrated",  &adc_cal,  "adc_calibrated/F");
+    t->Branch("over_threshold",  &ot,       "over_threshold/b");
+    t->Branch("time",            &ts,       "time/i");
+    t->Branch("udp_timestamp",   &udp_ts,   "udp_timestamp/i");
+    t->Branch("overflow",        &overflow, "overflow/i");
+    t->Branch("offset",          &off,      "offset/B");
+    t->Branch("bcid",            &bcid,     "bcid/s");
+    t->Branch("tdc",             &tdc,      "tdc/b");
+    t->Branch("timestamp_ns",    &ts_ns,    "timestamp_ns/D");
+    t->Branch("srs_timestamp",   &srs_ts,   "srs_timestamp/l");
+    t->Branch("abs_time_ns",     &abs_ts,   "abs_time_ns/D");
+    t->Branch("trigger_time",    &trg_time, "trigger_time/l");
+    t->Branch("trigger_counter", &trg_ctr,  "trigger_counter/s");
     for (long long i = 0; i < n; ++i) {
-        fec      = fec_a[i];      vmm  = vmm_a[i];      ch       = ch_a[i];
-        adc      = adc_a[i];      ot   = ot_a[i];        ts       = time_a[i];
-        udp_ts   = udp_ts_a[i];   overflow = overflow_a[i];
+        fec      = fec_a[i];      vmm      = vmm_a[i];      ch       = ch_a[i];
+        adc      = adc_a[i];      adc_cal  = adc_cal_a[i];  ot       = ot_a[i];
+        ts       = time_a[i];     udp_ts   = udp_ts_a[i];   overflow = overflow_a[i];
         off      = (signed char)off_a[i];
-        bcid     = bcid_a[i];     tdc  = tdc_a[i];       ts_ns    = ts_ns_a[i];
+        bcid     = bcid_a[i];     tdc      = tdc_a[i];
+        ts_ns    = ts_ns_a[i];    srs_ts   = srs_ts_a[i];   abs_ts   = abs_ts_a[i];
+        trg_time = trg_time_a[i]; trg_ctr  = trg_ctr_a[i];
         t->Fill();
     }
 }
@@ -817,6 +1067,34 @@ for v in vmm_ids:
     _fill1d(h_ovf, vdata['overflow'].values.astype(np.float64))
     h_ovf.Write()
 
+    h_abs = ROOT.TH1D("abs_time_ns", f"Absolute time — VMM {v};Absolute time (ns);Counts",
+                      TS_BINS, abs_min_ns, abs_max_ns)
+    _fill1d(h_abs, vdata['abs_time_ns'].values.astype(np.float64))
+    h_abs.Write()
+
+    if srs_max > srs_min:
+        h_srs = ROOT.TH1D("srs_timestamp",
+                           f"SRS marker timestamp — VMM {v};SRS timestamp (25 ns ticks);Counts",
+                           200, srs_min, srs_max)
+        _fill1d(h_srs, vdata['srs_timestamp'].values.astype(np.float64))
+        h_srs.Write()
+
+    if _has_calibration:
+        h_adccal = ROOT.TH1F("adc_calibrated",
+                              f"Calibrated ADC — VMM {v};Calibrated ADC;Counts",
+                              ADC_BINS, float(hits['adc_calibrated'].min()),
+                              float(hits['adc_calibrated'].max()))
+        _fill1d(h_adccal, vdata['adc_calibrated'].values.astype(np.float64))
+        h_adccal.Write()
+
+    if data_format == 'TRG' and hits['trigger_counter'].max() > 0:
+        h_tc = ROOT.TH1I("trigger_counter",
+                          f"Trigger counter — VMM {v};Trigger counter;Counts",
+                          min(200, int(hits['trigger_counter'].max()) + 1),
+                          0, int(hits['trigger_counter'].max()) + 1)
+        _fill1d(h_tc, vdata['trigger_counter'].values.astype(np.float64))
+        h_tc.Write()
+
     del vdata, adc_all, adc_ot, adc_not_ot
 
 # --- hits TTree: one row per hit, written into rf via Cling-compiled C++ filler ---
@@ -825,18 +1103,23 @@ if save_hits_tree:
     _hits_tree = ROOT.TTree("hits", "Per-hit data")
     ROOT._vmm_fill_hits(
         _hits_tree,
-        np.ascontiguousarray(hits['fec'].values,            dtype=np.uint8),
-        np.ascontiguousarray(hits['vmm'].values,            dtype=np.uint8),
-        np.ascontiguousarray(hits['ch'].values,             dtype=np.uint8),
-        np.ascontiguousarray(hits['adc'].values,            dtype=np.uint16),
-        np.ascontiguousarray(hits['over_threshold'].values, dtype=np.uint8),
-        np.ascontiguousarray(hits['time'].values,           dtype=np.uint32),
-        np.ascontiguousarray(hits['udp_timestamp'].values,  dtype=np.uint32),
-        np.ascontiguousarray(hits['overflow'].values,       dtype=np.uint32),
+        np.ascontiguousarray(hits['fec'].values,             dtype=np.uint8),
+        np.ascontiguousarray(hits['vmm'].values,             dtype=np.uint8),
+        np.ascontiguousarray(hits['ch'].values,              dtype=np.uint8),
+        np.ascontiguousarray(hits['adc'].values,             dtype=np.uint16),
+        np.ascontiguousarray(hits['adc_calibrated'].values,  dtype=np.float32),
+        np.ascontiguousarray(hits['over_threshold'].values,  dtype=np.uint8),
+        np.ascontiguousarray(hits['time'].values,            dtype=np.uint32),
+        np.ascontiguousarray(hits['udp_timestamp'].values,   dtype=np.uint32),
+        np.ascontiguousarray(hits['overflow'].values,        dtype=np.uint32),
         np.ascontiguousarray(hits['offset'].values.view(np.uint8)),
-        np.ascontiguousarray(hits['bcid'].values,           dtype=np.uint16),
-        np.ascontiguousarray(hits['tdc'].values,            dtype=np.uint8),
-        np.ascontiguousarray(hits['timestamp_ns'].values,   dtype=np.float64),
+        np.ascontiguousarray(hits['bcid'].values,            dtype=np.uint16),
+        np.ascontiguousarray(hits['tdc'].values,             dtype=np.uint8),
+        np.ascontiguousarray(hits['timestamp_ns'].values,    dtype=np.float64),
+        np.ascontiguousarray(hits['srs_timestamp'].values,   dtype=np.uint64),
+        np.ascontiguousarray(hits['abs_time_ns'].values,     dtype=np.float64),
+        np.ascontiguousarray(hits['trigger_time'].values,    dtype=np.uint64),
+        np.ascontiguousarray(hits['trigger_counter'].values, dtype=np.uint16),
         len(hits),
     )
     _hits_tree.Write()
