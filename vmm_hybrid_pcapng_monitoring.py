@@ -12,13 +12,16 @@ Output PNGs are saved in the same directory as the input file.
 hits DataFrame columns:
     fec            : FEC ID (last octet of source IP)
     vmm            : VMM ID (0-31, from packet data)
-    time           : frame counter (proxy for time; multiply by frame period for real time)
+    time           : frame counter (SRS header bytes 0-3)
+    udp_timestamp  : FEC hardware timestamp (SRS header bytes 8-11, 25 ns ticks / 40 MHz)
+    overflow       : BCID overflow count at last frame boundary (SRS header bytes 12-15)
     ch             : channel number (0-63)
     adc            : ADC value (0-1023)
     over_threshold : over-threshold flag (bool)
-    offset         : 5-bit signed offset (-16 to +15)
-    bcid           : bunch-crossing ID (0-4095, 12-bit)
+    offset         : 5-bit signed offset, #BCID overflows since last SRS marker (-16 to +15)
+    bcid           : bunch-crossing ID (0-4095, 12-bit, Gray-decoded)
     tdc            : TDC fine-timing value (0-255, 8-bit)
+    timestamp_ns   : chip_time in ns = (offset*4096 + bcid + 1.5)*22.5 - tdc*60/256
 """
 
 import sys
@@ -67,6 +70,19 @@ ROOT.gROOT.SetBatch('--live' not in sys.argv)
 #########################################
 PROBE_PACKETS = 500
 SRC_IP_OVERRIDE = None  # e.g. "192.168.1.13" to force a specific IP
+CLOCK_PERIOD_NS = 22.5  # ns per BCID count (44.44 MHz clock)
+TAC_SLOPE_NS    = 60.0  # ns full-scale of the TDC TAC ramp (default; tunable per VMM)
+
+
+def gray2bin_np(arr):
+    """Convert a numpy array of Gray-coded integers to binary (matches Lua gray2bin32)."""
+    arr = arr.astype(np.uint32)
+    arr ^= arr >> 16
+    arr ^= arr >> 8
+    arr ^= arr >> 4
+    arr ^= arr >> 2
+    arr ^= arr >> 1
+    return arr.astype(np.uint16)
 
 
 def detect_fec_ips(filename, n_probe=PROBE_PACKETS):
@@ -87,22 +103,26 @@ def detect_fec_ips(filename, n_probe=PROBE_PACKETS):
 # PARSE ONE UDP PAYLOAD BLOCK
 #########################################
 def parse_block(block: bytes, frame_counter: int, fec_id: int,
-                fec_buf, vmm_buf, time_buf, ch_buf, adc_buf, ot_buf,
-                offset_buf, bcid_buf, tdc_buf):
+                fec_buf, vmm_buf, time_buf, udp_ts_buf, overflow_buf,
+                ch_buf, adc_buf, ot_buf, offset_buf, bcid_buf, tdc_buf):
     if len(block) < 22 or block[4:7] != b'VM3':
         return
+    udp_ts   = struct.unpack_from('>I', block,  8)[0]  # SRS header bytes  8-11
+    overflow = struct.unpack_from('>I', block, 12)[0]  # SRS header bytes 12-15
     for i in range(0, len(block) - 22, 6):
         d1, d2 = struct.unpack_from('>IH', block, i + 16)
         if d2 & 0x8000:          # valid-hit flag = MSB of d2
             fec_buf.append(fec_id)
             vmm_buf.append((d1 >> 22) & 0x1F)   # bits 26-22 of d1
             time_buf.append(frame_counter)
+            udp_ts_buf.append(udp_ts)
+            overflow_buf.append(overflow)
             ch_buf.append((d2 >> 8) & 0x3F)     # bits 13-8 of d2
             adc_buf.append((d1 >> 12) & 0x3FF)  # bits 21-12 of d1
             ot_buf.append((d2 >> 14) & 0x1)     # bit 14 of d2
             raw_off = (d1 >> 27) & 0x1F          # bits 31-27 of d1 (5-bit signed)
             offset_buf.append(raw_off if raw_off < 16 else raw_off - 32)
-            bcid_buf.append(d1 & 0xFFF)          # bits 11-0 of d1
+            bcid_buf.append(d1 & 0xFFF)          # bits 11-0 of d1 — raw Gray code; decoded below
             tdc_buf.append(d2 & 0xFF)            # bits 7-0 of d2
 
 #########################################
@@ -282,15 +302,17 @@ if _args.live:
 # --------------------------------------------------------------------------
 
 # Memory-efficient typed arrays (no Python object overhead)
-fec_buf    = array.array('B')   # uint8
-vmm_buf    = array.array('B')   # uint8
-time_buf   = array.array('I')   # uint32 ('I'=unsigned int, always 4 bytes; 'L' is 8 bytes on 64-bit Linux)
-ch_buf     = array.array('B')   # uint8
-adc_buf    = array.array('H')   # uint16
-ot_buf     = array.array('B')   # uint8 (0/1)
-offset_buf = array.array('b')   # int8  (-16 to +15, 5-bit signed)
-bcid_buf   = array.array('H')   # uint16 (0-4095)
-tdc_buf    = array.array('B')   # uint8  (0-255)
+fec_buf      = array.array('B')   # uint8
+vmm_buf      = array.array('B')   # uint8
+time_buf     = array.array('I')   # uint32 — frame counter (SRS header bytes 0-3)
+udp_ts_buf   = array.array('I')   # uint32 — FEC hardware timestamp (SRS header bytes 8-11, 25 ns ticks)
+overflow_buf = array.array('I')   # uint32 — BCID overflow count at last frame (SRS header bytes 12-15)
+ch_buf       = array.array('B')   # uint8
+adc_buf      = array.array('H')   # uint16
+ot_buf       = array.array('B')   # uint8 (0/1)
+offset_buf   = array.array('b')   # int8  (-16 to +15, 5-bit signed)
+bcid_buf     = array.array('H')   # uint16 (0-4095)
+tdc_buf      = array.array('B')   # uint8  (0-255)
 
 print(f"Reading: {pcap_file}")
 pkt_count = 0
@@ -304,8 +326,8 @@ with PcapReader(pcap_file) as reader:
             fec_id = int(pkt[IP].src.split('.')[-1])
             n_before = len(fec_buf)
             parse_block(payload, fc, fec_id,
-                        fec_buf, vmm_buf, time_buf, ch_buf, adc_buf, ot_buf,
-                        offset_buf, bcid_buf, tdc_buf)
+                        fec_buf, vmm_buf, time_buf, udp_ts_buf, overflow_buf,
+                        ch_buf, adc_buf, ot_buf, offset_buf, bcid_buf, tdc_buf)
             if len(fec_buf) > n_before:
                 vm3_count += 1
         pkt_count += 1
@@ -315,18 +337,32 @@ with PcapReader(pcap_file) as reader:
 print(f"\nDone: {pkt_count} packets | {vm3_count} VM3 packets | {len(fec_buf):,} total hits")
 
 # Build DataFrame with compact dtypes
+_bcid_raw = np.frombuffer(bcid_buf,    dtype=np.uint16).copy()
+_offset   = np.frombuffer(offset_buf,  dtype=np.int8).copy()
+_tdc      = np.frombuffer(tdc_buf,     dtype=np.uint8).copy()
+_bcid     = gray2bin_np(_bcid_raw)     # Gray → binary, matching Lua gray2bin32
+# Full chip_time formula (ESS vmm-sdat docs):
+#   chip_time = (BCID + 1.5) × 22.5 ns  −  TDC × TAC_slope / 256
+#   t_hit     = offset × 4096 × 22.5 ns + chip_time
+_timestamp_ns = (
+    (_offset.astype(np.float64) * 4096 + _bcid.astype(np.float64) + 1.5) * CLOCK_PERIOD_NS
+    - _tdc.astype(np.float64) * TAC_SLOPE_NS / 256.0
+)
 hits = pd.DataFrame({
-    'fec':            np.frombuffer(fec_buf,    dtype=np.uint8).copy(),
-    'vmm':            np.frombuffer(vmm_buf,    dtype=np.uint8).copy(),
-    'time':           np.frombuffer(time_buf,   dtype=np.uint32).copy(),
-    'ch':             np.frombuffer(ch_buf,     dtype=np.uint8).copy(),
-    'adc':            np.frombuffer(adc_buf,    dtype=np.uint16).copy(),
-    'over_threshold': np.frombuffer(ot_buf,     dtype=np.uint8).astype(bool).copy(),
-    'offset':         np.frombuffer(offset_buf, dtype=np.int8).copy(),
-    'bcid':           np.frombuffer(bcid_buf,   dtype=np.uint16).copy(),
-    'tdc':            np.frombuffer(tdc_buf,    dtype=np.uint8).copy(),
+    'fec':            np.frombuffer(fec_buf,      dtype=np.uint8).copy(),
+    'vmm':            np.frombuffer(vmm_buf,      dtype=np.uint8).copy(),
+    'time':           np.frombuffer(time_buf,     dtype=np.uint32).copy(),
+    'udp_timestamp':  np.frombuffer(udp_ts_buf,   dtype=np.uint32).copy(),
+    'overflow':       np.frombuffer(overflow_buf, dtype=np.uint32).copy(),
+    'ch':             np.frombuffer(ch_buf,       dtype=np.uint8).copy(),
+    'adc':            np.frombuffer(adc_buf,      dtype=np.uint16).copy(),
+    'over_threshold': np.frombuffer(ot_buf,       dtype=np.uint8).astype(bool).copy(),
+    'offset':         _offset,
+    'bcid':           _bcid,
+    'tdc':            _tdc,
+    'timestamp_ns':   _timestamp_ns,
 })
-del fec_buf, vmm_buf, time_buf, ch_buf, adc_buf, ot_buf, offset_buf, bcid_buf, tdc_buf
+del fec_buf, vmm_buf, time_buf, udp_ts_buf, overflow_buf, ch_buf, adc_buf, ot_buf, offset_buf, bcid_buf, tdc_buf
 
 mem_mb = hits.memory_usage(deep=True).sum() / 1e6
 print(f"DataFrame memory: {mem_mb:.1f} MB")
@@ -338,12 +374,14 @@ for v in sorted(hits.vmm.unique()):
 #########################################
 # HISTOGRAM PARAMETERS
 #########################################
-ADC_BINS    = 100; ADC_MIN    = 0;   ADC_MAX    = 1024
-CH_BINS     = 64;  CH_MIN     = 0;   CH_MAX     = 64
-TIME_BINS   = 200
-BCID_BINS   = 100; BCID_MIN   = 0;   BCID_MAX   = 4096
-TDC_BINS    = 64;  TDC_MIN    = 0;   TDC_MAX    = 256
-OFFSET_BINS = 32;  OFFSET_MIN = -16; OFFSET_MAX = 16
+ADC_BINS      = 100; ADC_MIN      = 0;   ADC_MAX      = 1024
+CH_BINS       = 64;  CH_MIN       = 0;   CH_MAX       = 64
+TIME_BINS     = 200
+BCID_BINS     = 100; BCID_MIN     = 0;   BCID_MAX     = 4096
+TDC_BINS      = 64;  TDC_MIN      = 0;   TDC_MAX      = 256
+OFFSET_BINS   = 32;  OFFSET_MIN   = -16; OFFSET_MAX   = 16
+UDP_TS_BINS   = 200  # range set dynamically from data
+OVERFLOW_BINS = 200  # range set dynamically from data
 
 #########################################
 # PLOTS
@@ -510,6 +548,58 @@ for idx in range(n_vmm, nrows * ncols):
 fig_offset.tight_layout()
 _save(fig_offset, f"{base}_offset.png")
 
+# --- Full timestamp distribution ---
+TS_BINS = 200
+ts_min_ns = float(hits['timestamp_ns'].min())
+ts_max_ns = float(hits['timestamp_ns'].max())
+fig_ts, axes_ts = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows), squeeze=False)
+fig_ts.suptitle("Hit timestamp distribution per VMM (ns)", fontsize=14)
+for idx, v in enumerate(vmm_ids):
+    ax   = axes_ts[idx // ncols][idx % ncols]
+    data = hits.loc[hits.vmm == v, 'timestamp_ns']
+    ax.hist(data, bins=TS_BINS, range=(ts_min_ns, ts_max_ns), color='darkviolet', alpha=0.8)
+    ax.set_title(f"VMM {v}  ({len(data):,} hits)")
+    ax.set_xlabel("Timestamp (ns)")
+    ax.set_ylabel("Counts")
+for idx in range(n_vmm, nrows * ncols):
+    axes_ts[idx // ncols][idx % ncols].set_visible(False)
+fig_ts.tight_layout()
+_save(fig_ts, f"{base}_timestamp_ns.png")
+
+# --- UDP timestamp distribution ---
+udp_ts_min = int(hits['udp_timestamp'].min())
+udp_ts_max = int(hits['udp_timestamp'].max())
+fig_udpts, axes_udpts = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows), squeeze=False)
+fig_udpts.suptitle("UDP timestamp per VMM (40 MHz FEC clock, 25 ns ticks)", fontsize=14)
+for idx, v in enumerate(vmm_ids):
+    ax   = axes_udpts[idx // ncols][idx % ncols]
+    data = hits.loc[hits.vmm == v, 'udp_timestamp']
+    ax.hist(data, bins=UDP_TS_BINS, range=(udp_ts_min, udp_ts_max), color='slateblue', alpha=0.8)
+    ax.set_title(f"VMM {v}  ({len(data):,} hits)")
+    ax.set_xlabel("UDP timestamp (25 ns ticks)")
+    ax.set_ylabel("Counts")
+for idx in range(n_vmm, nrows * ncols):
+    axes_udpts[idx // ncols][idx % ncols].set_visible(False)
+fig_udpts.tight_layout()
+_save(fig_udpts, f"{base}_udp_timestamp.png")
+
+# --- Overflow (BCID overflow count at last frame boundary) distribution ---
+overflow_min = int(hits['overflow'].min())
+overflow_max = int(hits['overflow'].max())
+fig_ovf, axes_ovf = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows), squeeze=False)
+fig_ovf.suptitle("BCID overflow count at last frame boundary per VMM", fontsize=14)
+for idx, v in enumerate(vmm_ids):
+    ax   = axes_ovf[idx // ncols][idx % ncols]
+    data = hits.loc[hits.vmm == v, 'overflow']
+    ax.hist(data, bins=OVERFLOW_BINS, range=(overflow_min, overflow_max), color='sienna', alpha=0.8)
+    ax.set_title(f"VMM {v}  ({len(data):,} hits)")
+    ax.set_xlabel("Overflow count")
+    ax.set_ylabel("Counts")
+for idx in range(n_vmm, nrows * ncols):
+    axes_ovf[idx // ncols][idx % ncols].set_visible(False)
+fig_ovf.tight_layout()
+_save(fig_ovf, f"{base}_overflow.png")
+
 # --- Time distribution: one PNG per VMM (built and saved immediately to avoid accumulation) ---
 t_min, t_max = int(hits.time.min()), int(hits.time.max())
 for v in vmm_ids:
@@ -546,28 +636,37 @@ void _vmm_fill_hits(TTree* t,
                     const unsigned short* adc_a,
                     const unsigned char*  ot_a,
                     const unsigned int*   time_a,
+                    const unsigned int*   udp_ts_a,
+                    const unsigned int*   overflow_a,
                     const unsigned char*  off_a,
                     const unsigned short* bcid_a,
                     const unsigned char*  tdc_a,
+                    const double*         ts_ns_a,
                     long long n)
 {
     unsigned char  fec = 0, vmm = 0, ch = 0, ot = 0, tdc = 0;
     unsigned short adc = 0, bcid = 0;
-    unsigned int   ts  = 0;
+    unsigned int   ts = 0, udp_ts = 0, overflow = 0;
     signed char    off = 0;
-    t->Branch("fec",            &fec,  "fec/b");
-    t->Branch("vmm",            &vmm,  "vmm/b");
-    t->Branch("ch",             &ch,   "ch/b");
-    t->Branch("adc",            &adc,  "adc/s");
-    t->Branch("over_threshold", &ot,   "over_threshold/b");
-    t->Branch("time",           &ts,   "time/i");
-    t->Branch("offset",         &off,  "offset/B");
-    t->Branch("bcid",           &bcid, "bcid/s");
-    t->Branch("tdc",            &tdc,  "tdc/b");
+    double         ts_ns = 0.0;
+    t->Branch("fec",            &fec,      "fec/b");
+    t->Branch("vmm",            &vmm,      "vmm/b");
+    t->Branch("ch",             &ch,       "ch/b");
+    t->Branch("adc",            &adc,      "adc/s");
+    t->Branch("over_threshold", &ot,       "over_threshold/b");
+    t->Branch("time",           &ts,       "time/i");
+    t->Branch("udp_timestamp",  &udp_ts,   "udp_timestamp/i");
+    t->Branch("overflow",       &overflow, "overflow/i");
+    t->Branch("offset",         &off,      "offset/B");
+    t->Branch("bcid",           &bcid,     "bcid/s");
+    t->Branch("tdc",            &tdc,      "tdc/b");
+    t->Branch("timestamp_ns",   &ts_ns,    "timestamp_ns/D");
     for (long long i = 0; i < n; ++i) {
-        fec  = fec_a[i];  vmm  = vmm_a[i]; ch   = ch_a[i];
-        adc  = adc_a[i];  ot   = ot_a[i];  ts   = time_a[i];
-        off  = (signed char)off_a[i]; bcid = bcid_a[i]; tdc  = tdc_a[i];
+        fec      = fec_a[i];      vmm  = vmm_a[i];      ch       = ch_a[i];
+        adc      = adc_a[i];      ot   = ot_a[i];        ts       = time_a[i];
+        udp_ts   = udp_ts_a[i];   overflow = overflow_a[i];
+        off      = (signed char)off_a[i];
+        bcid     = bcid_a[i];     tdc  = tdc_a[i];       ts_ns    = ts_ns_a[i];
         t->Fill();
     }
 }
@@ -701,6 +800,23 @@ for v in vmm_ids:
     _fill1d(h_offset, vdata['offset'].values.astype(np.float64))
     h_offset.Write()
 
+    h_ts = ROOT.TH1D("timestamp_ns", f"Hit timestamp — VMM {v};Timestamp (ns);Counts",
+                     TS_BINS, ts_min_ns, ts_max_ns)
+    _fill1d(h_ts, vdata['timestamp_ns'].values.astype(np.float64))
+    h_ts.Write()
+
+    h_udpts = ROOT.TH1D("udp_timestamp",
+                         f"UDP timestamp — VMM {v};UDP timestamp (25 ns ticks);Counts",
+                         UDP_TS_BINS, udp_ts_min, udp_ts_max)
+    _fill1d(h_udpts, vdata['udp_timestamp'].values.astype(np.float64))
+    h_udpts.Write()
+
+    h_ovf = ROOT.TH1D("overflow",
+                       f"BCID overflow count — VMM {v};Overflow count;Counts",
+                       OVERFLOW_BINS, overflow_min, overflow_max)
+    _fill1d(h_ovf, vdata['overflow'].values.astype(np.float64))
+    h_ovf.Write()
+
     del vdata, adc_all, adc_ot, adc_not_ot
 
 # --- hits TTree: one row per hit, written into rf via Cling-compiled C++ filler ---
@@ -715,9 +831,12 @@ if save_hits_tree:
         np.ascontiguousarray(hits['adc'].values,            dtype=np.uint16),
         np.ascontiguousarray(hits['over_threshold'].values, dtype=np.uint8),
         np.ascontiguousarray(hits['time'].values,           dtype=np.uint32),
+        np.ascontiguousarray(hits['udp_timestamp'].values,  dtype=np.uint32),
+        np.ascontiguousarray(hits['overflow'].values,       dtype=np.uint32),
         np.ascontiguousarray(hits['offset'].values.view(np.uint8)),
         np.ascontiguousarray(hits['bcid'].values,           dtype=np.uint16),
         np.ascontiguousarray(hits['tdc'].values,            dtype=np.uint8),
+        np.ascontiguousarray(hits['timestamp_ns'].values,   dtype=np.float64),
         len(hits),
     )
     _hits_tree.Write()
