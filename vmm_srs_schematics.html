@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VMM3a / SRS Data Flow — Schematics</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, -apple-system, sans-serif; background: #F1F5F9;
+           color: #1E293B; padding: 28px 32px; max-width: 1800px; margin: 0 auto; }
+    header { margin-bottom: 24px; }
+    header h1 { font-size: 1.65rem; color: #0F172A; }
+    header p  { color: #64748B; font-size: 0.9rem; margin-top: 4px; }
+    nav { background: #E0F2FE; border: 1px solid #BAE6FD; border-radius: 8px;
+          padding: 10px 20px; margin-bottom: 32px; display: flex; flex-wrap: wrap; gap: 14px; }
+    nav a { color: #1D4ED8; text-decoration: none; font-weight: 600; font-size: 0.9rem; }
+    nav a:hover { text-decoration: underline; }
+    .panel { background: white; border-radius: 10px; padding: 26px 28px;
+             margin-bottom: 36px; box-shadow: 0 2px 10px #CBD5E160; }
+    .panel h2 { color: #1D4ED8; font-size: 1.15rem; margin-bottom: 10px; }
+    .panel .desc { color: #475569; font-size: 0.88rem; line-height: 1.65;
+                   margin-bottom: 18px; }
+    .panel .desc code { background: #F1F5F9; padding: 1px 5px; border-radius: 4px;
+                        font-size: 0.85em; color: #0E7490; }
+    .panel img { width: 100%; height: auto; border-radius: 6px;
+                 border: 1px solid #E2E8F0; display: block; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>VMM3a / SRS Readout System &#8212; Data Flow Schematics</h1>
+    <p>P2 basket hybrid detector &nbsp;&middot;&nbsp; CEA Saclay
+       &nbsp;&middot;&nbsp; Reference for VMM3a/SRS pcapng analysis</p>
+  </header>
+  <nav>
+    <a href="#schematic-1-hardware-chain">1 &middot; Hardware chain</a>
+    <a href="#schematic-2-vmm3a-hit-processing">2 &middot; VMM3a hit processing</a>
+    <a href="#schematic-3-clock-timeline">3 &middot; Clock, markers, offset, and TDC</a>
+    <a href="#schematic-4-timestamp-reconstruction">4 &middot; Timestamp reconstruction</a>
+  </nav>
+  <div class="panel" id="schematic-1-hardware-chain">
+    <h2>1 &middot; Hardware chain</h2>
+    <p class="desc">Signal path from detector strip through VMM3a ASIC and FEC FPGA to UDP packet on the network. Key numbers: 64 channels per VMM chip, Spartan7 FPGA at 44.44 MHz (22.5 ns clock), 9 010-byte UDP datagrams on port 6006.</p>
+    <img src="schematic_1_hardware_chain.png" alt="1 &middot; Hardware chain">
+  </div>
+  <div class="panel" id="schematic-2-vmm3a-hit-processing">
+    <h2>2 &middot; VMM3a hit processing</h2>
+    <p class="desc">Inside the VMM3a ASIC: discriminator fires on threshold crossing, BCID is latched, the pulse shaper reaches its peak, the peak finder triggers the TAC, and the ADC digitises the amplitude. Output is a 6-byte hit word containing channel, BCID, TDC, ADC, and offset.</p>
+    <img src="schematic_2_vmm3a_hit_processing.png" alt="2 &middot; VMM3a hit processing">
+  </div>
+  <div class="panel" id="schematic-3-clock-timeline">
+    <h2>3 &middot; Clock, markers, offset, and TDC</h2>
+    <p class="desc"><b>Top panel</b>: overview timeline — SRS markers reset the offset counter every ~92&nbsp;µs (one 4096-tick BCID cycle). Hit offset + BCID give the coarse time; TDC gives the sub-22.5&nbsp;ns fine-time correction. <b>Bottom panel</b>: zoom into 5 BC bins (0–112.5&nbsp;ns) showing the five steps in order. ① Threshold at t&nbsp;=&nbsp;5&nbsp;ns latches BCID&nbsp;=&nbsp;2000. ② Shaping time&nbsp;=&nbsp;90&nbsp;ns (4&nbsp;BC bins, chip ST register, range 25–200&nbsp;ns, not recorded per-hit) carries the pulse from threshold to peak. ③ Peak found at t&nbsp;=&nbsp;95&nbsp;ns in BCID&nbsp;=&nbsp;2004 — TAC starts. ④ BC edge at t&nbsp;=&nbsp;112.5&nbsp;ns — TAC stops; TDC&nbsp;=&nbsp;75&nbsp;→&nbsp;17.5&nbsp;ns. ⑤ <code>chip_time = (BCID_thr+1)×T_BC − TDC×60/256 ≈ t_threshold</code>; resolution 0.234&nbsp;ns/count.</p>
+    <img src="schematic_3_clock_timeline.png" alt="3 &middot; Clock, markers, offset, and TDC">
+  </div>
+  <div class="panel" id="schematic-4-timestamp-reconstruction">
+    <h2>4 &middot; Timestamp reconstruction</h2>
+    <p class="desc">Combining all fields into an absolute hit time: <code>abs_time_ns = srs_timestamp &times; 25&nbsp;ns + (offset &times; 4096 + BCID) &times; 22.5&nbsp;ns &minus; TDC &times; 60&nbsp;ns / 256</code>. The srs_timestamp (42-bit FEC free-running counter at 40&nbsp;MHz) provides the long-range absolute reference; chip_time gives the fine-grained hit position within the ~92&nbsp;µs BCID cycle.</p>
+    <img src="schematic_4_timestamp_reconstruction.png" alt="4 &middot; Timestamp reconstruction">
+  </div>
+</body>
+</html>

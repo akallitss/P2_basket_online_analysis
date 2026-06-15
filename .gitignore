@@ -1,0 +1,11 @@
+# Generated schematic images — regenerate by running vmm_srs_dataflow_schematic.py
+*.png
+
+# IDE
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
