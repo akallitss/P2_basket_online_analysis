@@ -24,11 +24,25 @@ import random
 # ─────────────────────────────────────────────
 # PARAMETERS
 # ─────────────────────────────────────────────
-N_CHANNELS = 64    # channels per plane  (real: 640)
-N_PHYSICAL = 200   # physical triplets   (real: 41581)
-N_BUCKETS  = 50    # ~ N_PHYSICAL / 4
+N_CHANNELS = 640    # channels per plane  (real: 640)
+N_PHYSICAL = 41_581   # physical triplets   (real: 41581)
+N_BUCKETS  = 10_000    # ~ N_PHYSICAL / 4
 
 random.seed(42)
+
+# ─────────────────────────────────────────────
+# Triplet <-> integer key packing
+# (defined up front so STEP 0 can sample keys directly,
+#  instead of materializing every possible triplet)
+# ─────────────────────────────────────────────
+def triplet_to_key(ch1, ch2, ch3):
+    return ch1 + ch2 * N_CHANNELS + ch3 * N_CHANNELS * N_CHANNELS
+
+def key_to_triplet(key):
+    ch3 = key // (N_CHANNELS ** 2)
+    ch2 = (key % (N_CHANNELS ** 2)) // N_CHANNELS
+    ch1 = key % N_CHANNELS
+    return (ch1, ch2, ch3)
 
 # ─────────────────────────────────────────────
 # STEP 0 — Monte Carlo: generate physical triplets
@@ -37,14 +51,14 @@ print("=" * 60)
 print("STEP 0 — generating physical triplets (Monte Carlo)")
 print("=" * 60)
 
-all_possible      = [(ch1, ch2, ch3)
-                     for ch1 in range(N_CHANNELS)
-                     for ch2 in range(N_CHANNELS)
-                     for ch3 in range(N_CHANNELS)]
-physical_triplets = random.sample(all_possible, N_PHYSICAL)
+# random.sample() on a range object never materializes the population
+# (640^3 = 262M tuples would be ~tens of GB if built as a list first).
+N_TOTAL       = N_CHANNELS ** 3
+physical_keys = random.sample(range(N_TOTAL), N_PHYSICAL)
+physical_triplets = [key_to_triplet(k) for k in physical_keys]
 physical_set      = set(physical_triplets)
 
-print(f"  Total possible triplets : {N_CHANNELS}^3 = {N_CHANNELS**3:,}")
+print(f"  Total possible triplets : {N_CHANNELS}^3 = {N_TOTAL:,}")
 print(f"  Physical triplets found : {N_PHYSICAL}")
 print(f"  First 5: {physical_triplets[:5]}")
 
@@ -55,16 +69,6 @@ print("\n" + "=" * 60)
 print("STEP 1 — convert triplets to integer keys")
 print("=" * 60)
 
-def triplet_to_key(ch1, ch2, ch3):
-    return ch1 + ch2 * N_CHANNELS + ch3 * N_CHANNELS * N_CHANNELS
-
-def key_to_triplet(key):
-    ch3 = key // (N_CHANNELS ** 2)
-    ch2 = (key % (N_CHANNELS ** 2)) // N_CHANNELS
-    ch1 = key % N_CHANNELS
-    return (ch1, ch2, ch3)
-
-physical_keys = [triplet_to_key(*t) for t in physical_triplets]
 print(f"  Example : {physical_triplets[0]} -> key = {physical_keys[0]}")
 print(f"  Reverse : key {physical_keys[0]} -> {key_to_triplet(physical_keys[0])}")
 
