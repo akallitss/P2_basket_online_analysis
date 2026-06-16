@@ -5,7 +5,7 @@ Created on 6/15/26 4:55 PM
 Created in PyCharm
 Created as chd_toy_montecarlo.py
 
-@author: ak271430
+@author: Alexandra Kallitsopoulou (alexandra.kallitsopoulou@cea.fr)
 """
 
 """
@@ -20,6 +20,27 @@ Simulates:
 """
 
 import random
+import sys
+from pathlib import Path
+
+# ─────────────────────────────────────────────
+# Tee stdout to a text file alongside the console
+# ─────────────────────────────────────────────
+OUTPUT_FILE = Path(__file__).with_name("chd_toy_montecarlo_output.txt")
+
+class _Tee:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for s in self.streams:
+            s.write(data)
+
+    def flush(self):
+        for s in self.streams:
+            s.flush()
+
+sys.stdout = _Tee(sys.stdout, open(OUTPUT_FILE, "w", encoding="utf-8"))
 
 # ─────────────────────────────────────────────
 # PARAMETERS

@@ -1,6 +1,9 @@
 # Generated schematic images — regenerate by running vmm_srs_dataflow_schematic.py
 *.png
 
+# Generated run output
+chd_toy_montecarlo_output.txt
+
 # IDE
 .idea/
 
