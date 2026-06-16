@@ -305,14 +305,14 @@ as compiled C++, so 100 M hits fill in seconds rather than hours.
 
 ## Requirements
 
-The script uses PyROOT to write a `.root` output file. The ROOT installation at
-`/local/home/ak271430/Software/root` was built against **Python 3.12**, so the
-script must be run with Python 3.12 — not the system default 3.13.
+The script uses PyROOT to write a `.root` output file, so it must be run with
+a Python interpreter matching the version your ROOT build was compiled against
+(e.g. ROOT built against Python 3.12 needs to be run with `python3.12`).
 
-A dedicated conda environment (`root312`) is set up with all required packages:
+A dedicated conda environment with all required packages works well:
 
 ```
-python = 3.12
+python = <version matching your ROOT build>
 numpy
 pandas
 matplotlib
@@ -320,7 +320,8 @@ scapy
 ROOT  (via sourcing thisroot.sh, see Usage below)
 ```
 
-To recreate the environment from scratch:
+To recreate the environment from scratch (adjust the Python version to match
+your ROOT build):
 
 ```bash
 conda create -n root312 python=3.12 pandas numpy matplotlib scapy -y
@@ -330,21 +331,34 @@ conda create -n root312 python=3.12 pandas numpy matplotlib scapy -y
 
 ## Usage
 
-Because ROOT must be on the Python path, always source `thisroot.sh` and invoke
-the `root312` conda environment explicitly:
+The script auto-detects and sources `thisroot.sh` itself — just run it with
+the Python interpreter from your ROOT-compatible environment:
 
 ```bash
-source /local/home/ak271430/Software/root/bin/thisroot.sh && \
-/local/home/ak271430/miniconda3/envs/root312/bin/python3.12 \
-    vmm_hybrid_pcapng_monitoring.py <path/to/capture.pcapng>
+python3 vmm_hybrid_pcapng_monitoring.py <path/to/capture.pcapng>
+```
+
+It locates ROOT in this order:
+1. Already importable in the current interpreter (e.g. you sourced
+   `thisroot.sh` yourself beforehand) — nothing else to do.
+2. `$THISROOT_SH`, if set, pointing directly at `thisroot.sh`.
+3. `$ROOTSYS/bin/thisroot.sh`, if `$ROOTSYS` is set.
+4. The `root` executable on your `$PATH`.
+5. A few common install locations (`~/Software/root`, `~/root`,
+   `/usr/local/root`, `/opt/root`).
+
+If none of these find your ROOT install, set `$ROOTSYS` (or `$THISROOT_SH`)
+once in your shell profile, e.g.:
+
+```bash
+export ROOTSYS=/path/to/your/root/install
 ```
 
 ### Example
 
 ```bash
-source /local/home/ak271430/Software/root/bin/thisroot.sh && \
-/local/home/ak271430/miniconda3/envs/root312/bin/python3.12 \
-    vmm_hybrid_pcapng_monitoring.py /data/run042/hybrid_run042.pcapng
+export ROOTSYS=/path/to/your/root/install   # only needed once, e.g. in ~/.bashrc
+python3 vmm_hybrid_pcapng_monitoring.py /data/run042/hybrid_run042.pcapng
 ```
 
 Console output:

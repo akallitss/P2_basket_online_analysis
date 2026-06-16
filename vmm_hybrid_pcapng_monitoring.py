@@ -37,16 +37,80 @@ hits DataFrame columns:
 import sys
 import os
 import struct
+import shutil
+import subprocess
 
-# Self-re-exec: ROOT was built against Python 3.12; if we're running under any
-# other interpreter, replace this process with the right one (sourcing thisroot.sh
-# first so PyROOT finds its shared libraries).
-_ROOT312  = "/local/home/ak271430/miniconda3/envs/root312/bin/python3.12"
-_THISROOT = "/local/home/ak271430/Software/root/bin/thisroot.sh"
-if sys.executable != _ROOT312:
+# Self-re-exec: PyROOT needs thisroot.sh sourced before the interpreter starts
+# so it can find ROOT's shared libraries, AND it needs an interpreter matching
+# the Python version ROOT was built against — a mismatched-but-importable
+# interpreter doesn't fail fast, it makes cppyy hang for minutes re-JITing
+# headers. So: locate thisroot.sh, check root-config for the required Python
+# version, and pick a matching interpreter before re-exec'ing.
+def _find_thisroot():
+    env_path = os.environ.get("THISROOT_SH")
+    if env_path and os.path.isfile(env_path):
+        return env_path
+    rootsys = os.environ.get("ROOTSYS")
+    candidates = []
+    if rootsys:
+        candidates.append(os.path.join(rootsys, "bin", "thisroot.sh"))
+    root_bin = shutil.which("root")
+    if root_bin:
+        candidates.append(os.path.join(os.path.dirname(os.path.realpath(root_bin)), "thisroot.sh"))
+    candidates += [
+        os.path.expanduser("~/Software/root/bin/thisroot.sh"),
+        os.path.expanduser("~/root/bin/thisroot.sh"),
+        "/usr/local/root/bin/thisroot.sh",
+        "/opt/root/bin/thisroot.sh",
+    ]
+    return next((c for c in candidates if os.path.isfile(c)), None)
+
+
+def _root_python_version(thisroot_sh):
+    """Major.minor Python version ROOT's PyROOT was built against, via root-config."""
+    root_config = os.path.join(os.path.dirname(thisroot_sh), "root-config")
+    if not os.path.isfile(root_config):
+        return None
+    try:
+        out = subprocess.run([root_config, "--python3-version"],
+                              capture_output=True, text=True, timeout=5, check=True)
+        return ".".join(out.stdout.strip().split(".")[:2]) or None
+    except Exception:
+        return None
+
+
+try:
+    import ROOT  # noqa: F401  (already on PYTHONPATH, nothing to do)
+    del ROOT
+except ImportError:
+    _thisroot = _find_thisroot()
+    if _thisroot is None:
+        sys.exit(
+            "ERROR: could not find ROOT's thisroot.sh.\n"
+            "Set $ROOTSYS (or $THISROOT_SH) to point at your ROOT install, "
+            "or make sure 'root' is on your PATH, then re-run."
+        )
+
+    _py = os.environ.get("ROOT_PYTHON")
+    if not _py:
+        _required_mm = _root_python_version(_thisroot)
+        _current_mm = "%d.%d" % sys.version_info[:2]
+        if _required_mm and _required_mm != _current_mm:
+            _py = shutil.which(f"python{_required_mm}")
+            if _py is None:
+                sys.exit(
+                    f"ERROR: ROOT requires Python {_required_mm}, but no "
+                    f"'python{_required_mm}' was found on $PATH (current "
+                    f"interpreter is {_current_mm}).\n"
+                    "Activate an environment with that Python version, or "
+                    "set $ROOT_PYTHON to the right interpreter, then re-run."
+                )
+        else:
+            _py = sys.executable
+
     os.execvp("bash", [
         "bash", "-c",
-        f'source "{_THISROOT}" && exec "{_ROOT312}" "$@"',
+        f'source "{_thisroot}" && exec "{_py}" "$@"',
         "python", *sys.argv,
     ])
 
