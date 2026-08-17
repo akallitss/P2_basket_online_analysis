@@ -2,6 +2,12 @@
 
 Scripts for reading and analysing binary pcapng files produced by the VMM3 ASIC readout chain (FEC over UDP). Developed for irradiation measurements with VMM hybrids (no detector involved).
 
+> **Online beam pipeline:** the SPS beam test runs a split pipeline —
+> `vmm_reduce.py` decodes a capture into additive histograms, `vmm_pcapng_qa.py`
+> renders plots from those and never reads a pcapng. See
+> [README_online_pipeline.md](README_online_pipeline.md). The all-in-one script
+> documented below is still the offline ROOT + PNG tool.
+
 ---
 
 ## Scripts
